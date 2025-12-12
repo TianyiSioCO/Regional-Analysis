@@ -19,7 +19,7 @@ References:
   - NSRDB TMY (Typical Meteorological Year) data format
   - pvlib solar position algorithms
 
-Author: Agritrack Research Team
+Author: Cornell EERL TZ
 """
 from __future__ import annotations
 
@@ -1055,62 +1055,181 @@ def _daily_radiation_average(model: ConcreteModel, day: int, steps_per_day: floa
     return sum(model.ground_radiation_plant[t] for t in range(start_idx, end_idx)) / (duration / 86400)
 
 
-def compute_baseline_cf(
-    source: Path,
+def compute_baseline_power(
     metadata: Dict[str, str],
     weather_data: pd.DataFrame,
     config: AgritrackConfig,
-    solver_name: str,
-    solver_executable: Optional[str],
-) -> float:
-    """Compute baseline CF_ST: unconstrained dynamic tracking without DLI constraints.
+) -> Tuple[float, float, np.ndarray]:
+    """Compute baseline power using Standard Tracking (ST) mode.
+
+    Standard Tracking follows the optimal sun-tracking angle without any DLI constraints,
+    representing the theoretical maximum power generation for the system.
+
+    This function directly calculates power without using the optimization solver,
+    since ST mode has fixed angles and no optimization is needed.
 
     Args:
-        source: Path to CSV file
         metadata: Metadata dictionary
         weather_data: Weather data DataFrame
-        config: Configuration (temporarily modified to unconstrained mode)
-        solver_name: Solver name
-        solver_executable: Optional path to solver executable
+        config: Configuration object
 
     Returns:
-        Baseline capacity factor CF_ST (percentage)
+        Tuple of (baseline_power_wh, baseline_cf_percent, power_array)
+        - baseline_power_wh: Total power generation in Wh
+        - baseline_cf_percent: Capacity factor as percentage
+        - power_array: Hourly power values [W]
     """
-    # Create configuration copy with unconstrained dynamic tracking
-    import copy
-    baseline_config = copy.deepcopy(config)
-    baseline_config.tracking.strategy = "dynamic"
-    # Set very low DLI target to effectively disable constraint
-    baseline_config.control.dli_target = 0.0
+    location = config.location
+    pv_cfg = config.pv
+    weather_cfg = config.weather
+    power_cfg = config.power
+    tracking = config.tracking
 
-    try:
-        result = solve_for_weather(
-            source, metadata, weather_data, baseline_config, solver_name, solver_executable
-        )
-        return result.capacity_factor
-    except RuntimeError as e:
-        print(f"Warning: Solver failed during baseline CF calculation: {e}")
-        return 0.0
+    hourly_timesteps = weather_data.index
+    if len(hourly_timesteps) < 2:
+        return 0.0, 0.0, np.array([])
+
+    # Get solar position
+    latitude = _safe_float(metadata.get("latitude"), location.latitude)
+    longitude = _safe_float(metadata.get("longitude"), location.longitude)
+    site_location = pvlib.location.Location(
+        latitude=latitude,
+        longitude=longitude,
+        tz=location.timezone,
+    )
+    solar_angles = site_location.get_solarposition(hourly_timesteps)
+    theta_e_deg = solar_angles["apparent_elevation"].astype(float).values
+    phi_a_deg = solar_angles["azimuth"].astype(float).values
+
+    # Extract irradiance
+    dni = weather_data["dni"].astype(float).values
+    dhi = weather_data["dhi"].astype(float).values
+    ghi = weather_data["ghi"].astype(float).values
+    air_temp = weather_data["temperature"].astype(float).values
+
+    # Solar geometry calculations
+    theta_e_deg[ghi > 0] = np.maximum(theta_e_deg[ghi > 0], 5.0)
+    theta_e_deg[ghi == 0] = 1e-6
+    phi_r = np.deg2rad(phi_a_deg - pv_cfg.site_azimuth)
+    theta_e = np.deg2rad(theta_e_deg)
+
+    sin_phi_r = np.sin(phi_r)
+    cos_phi_r = np.cos(phi_r)
+    sin_theta_e = np.sin(theta_e)
+    cos_theta_e = np.cos(theta_e)
+
+    # Calculate optimal tracking angle
+    optimal_angle = np.arctan((cos_theta_e * sin_phi_r) / sin_theta_e)
+    theta_z_xz = np.arctan((cos_theta_e * np.abs(sin_phi_r)) / sin_theta_e)
+    max_tilt_rad = np.radians(tracking.max_angle)
+
+    # Standard tracking: constrained to max angle
+    angle_tracking = np.clip(optimal_angle, -max_tilt_rad, max_tilt_rad)
+
+    # Apply backtracking
+    sun_up = np.heaviside(theta_e, 1)
+    panel_width_shadow = (
+        (sin_phi_r / np.tan(theta_e) * np.sin(angle_tracking) + np.cos(angle_tracking))
+        * pv_cfg.width
+        * sun_up
+    )
+
+    if tracking.backtrack:
+        for idx in range(len(theta_e)):
+            if panel_width_shadow[idx] > pv_cfg.interrow_spacing:
+                cos_arg = pv_cfg.interrow_spacing / pv_cfg.width * np.cos(theta_z_xz[idx])
+                if abs(cos_arg) <= 1:
+                    dtheta = np.arccos(cos_arg)
+                    if optimal_angle[idx] >= 0:
+                        angle_tracking[idx] = optimal_angle[idx] - dtheta
+                    else:
+                        angle_tracking[idx] = optimal_angle[idx] + dtheta
+
+    angle_tracking *= sun_up
+    theta = angle_tracking  # Final tracker angles for ST mode
+
+    # Calculate irradiance components
+    a, b, c = weather_cfg.diffuse_fraction_coeff
+
+    # cos(AOI)
+    cos_aoi = np.cos(theta) * sin_theta_e + np.sin(theta) * cos_theta_e * sin_phi_r
+
+    # Blockage angles
+    blockage_large = np.arctan(
+        pv_cfg.width / 2 * np.sin(theta)
+        / (pv_cfg.interrow_spacing - pv_cfg.width / 2 * np.cos(theta))
+    )
+    blockage_small = np.arctan(
+        pv_cfg.width / 2 * np.sin(theta)
+        / (pv_cfg.interrow_spacing + pv_cfg.width / 2 * np.cos(theta))
+    )
+
+    # Ground radiation
+    diffuse_fraction = a * theta**4 + b * theta**2 + c
+    panel_shadow = (
+        (sin_phi_r / np.tan(theta_e) * np.sin(theta) + np.cos(theta)) * pv_cfg.width
+    )
+    panel_shadow = np.clip(panel_shadow, 0, pv_cfg.interrow_spacing)
+    ground_radiation = (
+        (1 - panel_shadow / pv_cfg.interrow_spacing) * sin_theta_e * dni
+        + dhi * diffuse_fraction
+    )
+
+    # Front surface irradiance
+    front_irradiance = (
+        cos_aoi * dni
+        + dhi * (np.cos(theta + blockage_large) + 1) / 2
+        + weather_cfg.albedo * ground_radiation * (1 - np.cos(theta - blockage_small)) / 2
+    )
+
+    # Back surface irradiance
+    back_irradiance = (
+        dhi * (1 - np.cos(theta - blockage_small)) / 2
+        + weather_cfg.albedo * ground_radiation * (np.cos(theta + blockage_large) + 1) / 2
+    )
+
+    # Total incident irradiance
+    if power_cfg.bifacial:
+        incident_irradiance = front_irradiance + back_irradiance * power_cfg.bifaciality_factor
+    else:
+        incident_irradiance = front_irradiance
+
+    # Cell temperature
+    heat_input = (front_irradiance + back_irradiance) * power_cfg.alpha_absorption * (1 - power_cfg.module_efficiency)
+    cell_temp = air_temp + heat_input / (power_cfg.u_c + power_cfg.u_v * power_cfg.wind_speed_default)
+
+    # Power generation
+    power_values = (
+        power_cfg.pdc0
+        * incident_irradiance / 1000
+        * (1 + power_cfg.gamma_pdc * (cell_temp - power_cfg.temperature_ref))
+    )
+    power_values = np.maximum(power_values, 0)  # No negative power
+
+    total_power = float(np.sum(power_values))
+    capacity_factor = (total_power / (len(power_values) * power_cfg.pdc0) * 100) if len(power_values) > 0 else 0.0
+
+    return total_power, capacity_factor, power_values
 
 
-def search_dli_for_target_prr(
+def search_dli_for_target_power_ratio(
     source: Path,
     metadata: Dict[str, str],
     weather_data: pd.DataFrame,
     config: AgritrackConfig,
     solver_name: str,
     solver_executable: Optional[str],
-    baseline_cf: float,
-    target_prr: float,
+    baseline_power: float,
+    target_power_ratio: float,
     dli_min: float,
     dli_max: float,
     tolerance: float,
     max_iter: int,
 ) -> AgritrackResult:
-    """Binary search for DLI value that achieves target PRR.
+    """Binary search for DLI value that achieves target power ratio.
 
-    PRR = CF_CS / CF_ST × 100
-    Objective: Find DLI such that PRR ≈ target_prr
+    This is a simpler and more intuitive approach than PRR.
+    Directly uses power generation ratio: P_target = P_baseline × ratio
 
     Args:
         source: Path to CSV file
@@ -1119,11 +1238,11 @@ def search_dli_for_target_prr(
         config: Base configuration
         solver_name: Solver name
         solver_executable: Optional path to solver executable
-        baseline_cf: Baseline CF_ST
-        target_prr: Target PRR percentage
+        baseline_power: Baseline total power from standard tracking [Wh]
+        target_power_ratio: Target ratio (0-1), e.g., 0.8 = 80% of baseline
         dli_min: Lower bound for DLI search
         dli_max: Upper bound for DLI search
-        tolerance: PRR error tolerance (percentage points)
+        tolerance: Power ratio error tolerance (e.g., 0.01 = 1%)
         max_iter: Maximum number of search iterations
 
     Returns:
@@ -1131,21 +1250,19 @@ def search_dli_for_target_prr(
     """
     import copy
 
-    # Calculate target CF
-    target_cf = target_prr * baseline_cf / 100.0
-    print(f"  Baseline CF_ST: {baseline_cf:.2f}%")
-    print(f"  Target PRR: {target_prr:.1f}% -> Target CF: {target_cf:.2f}%")
+    target_power = baseline_power * target_power_ratio
+    print(f"  Baseline Power: {baseline_power/1e6:.2f} MWh")
+    print(f"  Target Power Ratio: {target_power_ratio*100:.1f}% -> Target Power: {target_power/1e6:.2f} MWh")
     print(f"  DLI search range: [{dli_min}, {dli_max}] mol/m²/day")
 
     low, high = dli_min, dli_max
     best_result: Optional[AgritrackResult] = None
-    best_prr_diff = float("inf")
+    best_power_diff = float("inf")
     best_dli = dli_min
 
     for iteration in range(max_iter):
         mid_dli = (low + high) / 2.0
 
-        # Use current DLI target to conduct optimization
         test_config = copy.deepcopy(config)
         test_config.control.dli_target = mid_dli
 
@@ -1153,49 +1270,47 @@ def search_dli_for_target_prr(
             result = solve_for_weather(
                 source, metadata, weather_data, test_config, solver_name, solver_executable
             )
-            current_cf = result.capacity_factor
-            current_prr = (current_cf / baseline_cf) * 100.0 if baseline_cf > 0 else 0.0
-            prr_diff = abs(current_prr - target_prr)
+            current_power = float(np.sum(result.power_w))
+            current_ratio = current_power / baseline_power if baseline_power > 0 else 0.0
+            ratio_diff = abs(current_ratio - target_power_ratio)
 
-            print(f"  Iteration {iteration + 1}: DLI={mid_dli:.2f} -> CF={current_cf:.2f}%, PRR={current_prr:.2f}%")
+            print(f"  Iteration {iteration + 1}: DLI={mid_dli:.2f} -> Power={current_power/1e6:.2f} MWh, Ratio={current_ratio*100:.2f}%")
 
             # Record best result
-            if prr_diff < best_prr_diff:
-                best_prr_diff = prr_diff
+            if ratio_diff < best_power_diff:
+                best_power_diff = ratio_diff
                 best_result = result
                 best_dli = mid_dli
 
             # Check if tolerance is reached
-            if prr_diff <= tolerance:
-                print(f"  Converged! Found DLI={mid_dli:.2f} achieving PRR={current_prr:.2f}% (target {target_prr}%)")
+            if ratio_diff <= tolerance:
+                print(f"  Converged! Found DLI={mid_dli:.2f} achieving Power Ratio={current_ratio*100:.2f}% (target {target_power_ratio*100:.1f}%)")
                 break
 
             # Binary search logic:
-            # Higher DLI -> stronger power constraint -> lower CF -> lower PRR
-            # If PRR is too high, increase DLI (stronger constraint)
-            if current_prr > target_prr:
-                low = mid_dli  # PRR too high, raise DLI lower bound
+            # Higher DLI -> more light to crops -> less power -> lower ratio
+            if current_ratio > target_power_ratio:
+                low = mid_dli  # Ratio too high, increase DLI (reduce power)
             else:
-                high = mid_dli  # PRR too low, reduce DLI upper bound
+                high = mid_dli  # Ratio too low, decrease DLI (increase power)
 
         except RuntimeError as e:
             print(f"  Iteration {iteration + 1}: DLI={mid_dli:.2f} -> Solver failed: {e}")
-            # If solver fails, DLI constraint is too strong, reduce DLI
             high = mid_dli
 
     if best_result is None:
-        raise RuntimeError(f"Unable to find DLI value satisfying target PRR={target_prr}%")
+        raise RuntimeError(f"Unable to find DLI value satisfying target power ratio={target_power_ratio*100:.1f}%")
 
-    # Calculate DLI-related metrics
+    # Calculate metrics
     dli_avg = float(np.mean(best_result.dli_series))
-    achieved_prr = (best_result.capacity_factor / baseline_cf) * 100.0 if baseline_cf > 0 else 0.0
-    # DRR = actual average DLI / target DLI × 100
+    achieved_ratio = float(np.sum(best_result.power_w)) / baseline_power if baseline_power > 0 else 0.0
     drr = (dli_avg / best_dli) * 100.0 if best_dli > 0 else 0.0
 
     # Update result object
-    best_result.baseline_cf = baseline_cf
-    best_result.target_prr = target_prr
-    best_result.achieved_prr = achieved_prr
+    best_result.baseline_cf = (baseline_power / (len(best_result.power_w) * config.power.pdc0)) * 100 if len(best_result.power_w) > 0 else 0.0
+    best_result.target_prr = target_power_ratio * 100  # Store as percentage for compatibility
+    best_result.achieved_prr = achieved_ratio * 100
+    best_result.prr = achieved_ratio * 100
     best_result.dli_target_found = best_dli
     best_result.dli_avg = dli_avg
     best_result.drr = drr
@@ -1269,15 +1384,20 @@ def write_outputs(
 
 def find_data_files(data_dir: Path) -> list:
     """
-    Automatically scan for CSV files in subdirectories under data directory.
+    Automatically scan for CSV files in data directory.
 
-    Directory structure example:
-        data/
-        ├── 1/
-        │   └── 1077174_42.49_-79.46_tmy-2024.csv
-        ├── 2/
-        │   └── 1080822_42.49_-79.30_tmy-2024.csv
-        └── ...
+    Supports two directory structures:
+        1. Flat structure (new):
+            data/
+            ├── 1238842_40.57_-74.18_2020.csv
+            ├── 1241405_40.57_-74.09_2020.csv
+            └── ...
+
+        2. Nested structure (legacy):
+            data/
+            ├── subfolder1/
+            │   └── xxx_tmy-2024.csv
+            └── ...
 
     Returns:
         List of CSV file paths
@@ -1286,38 +1406,57 @@ def find_data_files(data_dir: Path) -> list:
     if not data_dir.exists():
         return csv_files
 
-    # Iterate through subdirectories
+    # First, try flat structure: CSV files directly in data directory
+    direct_csvs = list(data_dir.glob("*.csv"))
+    if direct_csvs:
+        # Use flat structure
+        csv_files = [str(f) for f in sorted(direct_csvs)]
+        return csv_files
+
+    # Fallback: nested structure (legacy)
     for subdir in sorted(data_dir.iterdir()):
         if subdir.is_dir():
-            # Find CSV files in subdirectory (exclude non-TMY data files)
-            for csv_file in subdir.glob("*_tmy*.csv"):
+            for csv_file in subdir.glob("*.csv"):
                 csv_files.append(str(csv_file))
 
     return csv_files
 
 
 def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Batch computation of agrivoltaic tracking strategy results")
+    parser = argparse.ArgumentParser(
+        description="Agrivoltaic Tracking Optimization - Power Generation vs Crop DLI",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Forward mode: Input DLI=25, output power generation
+  python main.py --forward --dli-target 25
+
+  # Reverse mode: Find DLI for 80%% of baseline power
+  python main.py --target-power-ratio 0.8
+
+  # Reverse mode with custom search range
+  python main.py --target-power-ratio 0.8 --dli-min 10 --dli-max 40
+        """
+    )
 
     # Compute default input files: automatically scan data subdirectories
     script_dir = Path(__file__).parent
     data_dir = script_dir / "data"
     default_inputs = find_data_files(data_dir)
     if not default_inputs:
-        # If no subdirectory files found, fall back to legacy default
         default_inputs = [str(script_dir / "data" / "data1.csv")]
 
     parser.add_argument(
         "--inputs",
         nargs="+",
         default=default_inputs,
-        help="CSV paths to process, defaults to auto-scanning TMY files in data/ subdirectories",
+        help="CSV paths to process, defaults to auto-scanning TMY files in data/",
     )
     parser.add_argument(
         "--criteria",
         choices=["dli", "biomass"],
         default="dli",
-        help="Plant constraint type, supports DLI or Biomass",
+        help="Plant constraint type (default: dli)",
     )
     parser.add_argument(
         "--output-dir",
@@ -1327,91 +1466,101 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--solver",
         default="ipopt",
-        help="Pyomo solver name, default: ipopt",
+        help="Pyomo solver name (default: ipopt)",
     )
     parser.add_argument(
         "--solver-executable",
         default=None,
         help="Optional: path to solver executable",
     )
-    # Reverse mode parameters: input PRR% to search for DLI (reverse mode enabled by default)
-    parser.add_argument(
-        "--target-prr",
-        type=float,
-        default=90.0,
-        help="Target PRR percentage (reverse mode), default 90%%. Set to 0 to switch to forward mode",
-    )
-    parser.add_argument(
+
+    # Mode selection
+    mode_group = parser.add_argument_group("Mode Selection")
+    mode_group.add_argument(
         "--forward",
         action="store_true",
-        help="Use forward mode (input DLI -> compute PRR), overrides --target-prr",
+        help="Forward mode: Input DLI -> Output Power (default if --target-power-ratio not set)",
     )
-    parser.add_argument(
+    mode_group.add_argument(
+        "--target-power-ratio",
+        type=float,
+        default=None,
+        metavar="RATIO",
+        help="Reverse mode: Target power ratio (0-1), e.g., 0.8 = 80%% of ST baseline power",
+    )
+
+    # Forward mode parameters
+    forward_group = parser.add_argument_group("Forward Mode Parameters")
+    forward_group.add_argument(
         "--dli-target",
         type=float,
         default=30.0,
-        help="DLI target value for forward mode (mol/m²/day), default 30",
+        metavar="DLI",
+        help="DLI target value (mol/m²/day), default 30",
     )
-    parser.add_argument(
+
+    # Reverse mode parameters
+    reverse_group = parser.add_argument_group("Reverse Mode Parameters (DLI Search)")
+    reverse_group.add_argument(
         "--dli-min",
         type=float,
         default=15.0,
+        metavar="MIN",
         help="Lower bound for DLI search (mol/m²/day), default 15",
     )
-    parser.add_argument(
+    reverse_group.add_argument(
         "--dli-max",
         type=float,
         default=50.0,
+        metavar="MAX",
         help="Upper bound for DLI search (mol/m²/day), default 50",
     )
-    parser.add_argument(
+    reverse_group.add_argument(
         "--tolerance",
         type=float,
-        default=0.5,
-        help="PRR error tolerance (percentage points), default 0.5",
+        default=1.0,
+        metavar="TOL",
+        help="Power ratio error tolerance (%%), default 1.0",
     )
-    parser.add_argument(
+    reverse_group.add_argument(
         "--max-iter",
         type=int,
         default=20,
+        metavar="N",
         help="Maximum search iterations, default 20",
     )
 
-    args = parser.parse_args()
-
-    # If --forward is specified, disable reverse mode
-    if args.forward:
-        args.target_prr = None
-    # If target_prr is 0, also treat as disabled reverse mode
-    elif args.target_prr == 0:
-        args.target_prr = None
-
-    return args
+    return parser.parse_args()
 
 
 def main() -> None:
     args = parse_arguments()
     config = AgritrackConfig()
     config.control.criteria = args.criteria
-    config.control.dli_target = args.dli_target  # Set DLI target from command line arguments
+    config.control.dli_target = args.dli_target
     output_dir = Path(args.output_dir)
     summaries = []
     point_records = []
 
-    # Determine execution mode
-    reverse_mode = args.target_prr is not None
+    # Simplified mode selection: power_ratio (reverse) vs forward
+    # - Reverse mode: Input target power ratio -> Search DLI
+    # - Forward mode: Input DLI -> Compute Power
+    reverse_mode = args.target_power_ratio is not None
+
     if reverse_mode:
-        print(f"=== Reverse Mode: Input PRR={args.target_prr}% -> Search DLI ===")
+        print(f"=== Reverse Mode: Target Power Ratio {args.target_power_ratio*100:.1f}% -> Search DLI ===")
+        print(f"  Baseline: Standard Tracking (ST) power generation")
         print(f"  DLI search range: [{args.dli_min}, {args.dli_max}] mol/m²/day")
-        print(f"  PRR tolerance: {args.tolerance}%")
+        print(f"  Tolerance: {args.tolerance}%")
     else:
-        print(f"=== Forward Mode: Input DLI={args.dli_target} -> Compute PRR ===")
+        print(f"=== Forward Mode: Input DLI={args.dli_target} -> Compute Power ===")
+        print(f"  Baseline: Standard Tracking (ST) power generation")
 
     for idx, input_path in enumerate(args.inputs, 1):
         csv_path = Path(input_path)
         if not csv_path.exists():
             raise FileNotFoundError(f"Input file not found: {csv_path}")
-        # Use new LocationConfig for each file to avoid location info reuse
+
         metadata, weather_data, updated_location = load_weather_data(csv_path, LocationConfig())
         config.location = updated_location
         print(f"\n[{idx}/{len(args.inputs)}] Loaded file: {csv_path}")
@@ -1419,71 +1568,92 @@ def main() -> None:
         print(f"  Timezone: {updated_location.timezone}")
         print(f"  Time range: {updated_location.start} ~ {updated_location.end}")
 
-        if reverse_mode:
-            # Reverse mode: first compute baseline CF_ST, then search for DLI
-            print("  Computing baseline CF_ST (unconstrained dynamic tracking)...")
-            baseline_cf = compute_baseline_cf(
-                csv_path, metadata, weather_data, config, args.solver, args.solver_executable
-            )
-            print(f"  Baseline CF_ST: {baseline_cf:.2f}%")
+        # Always compute baseline power using Standard Tracking (ST)
+        print("  Computing baseline power (Standard Tracking mode)...")
+        baseline_power, baseline_cf, _ = compute_baseline_power(metadata, weather_data, config)
+        print(f"  Baseline Power (ST): {baseline_power/1e6:.4f} MWh, CF: {baseline_cf:.2f}%")
 
-            print("  Searching for DLI that achieves target PRR...")
-            result = search_dli_for_target_prr(
+        if reverse_mode:
+            # Reverse mode: Input target power ratio -> Search DLI
+            print(f"  Searching for DLI that achieves {args.target_power_ratio*100:.1f}% power ratio...")
+            result = search_dli_for_target_power_ratio(
                 csv_path, metadata, weather_data, config,
                 args.solver, args.solver_executable,
-                baseline_cf, args.target_prr,
+                baseline_power, args.target_power_ratio,
                 args.dli_min, args.dli_max,
-                args.tolerance, args.max_iter
+                args.tolerance / 100.0,
+                args.max_iter
             )
 
             timeseries_path, point_record = write_outputs(result, output_dir, reverse_mode=True)
+            point_record["baseline_power_mwh"] = baseline_power / 1e6
+            point_record["achieved_power_mwh"] = float(np.sum(result.power_w)) / 1e6
+            point_record["power_ratio_percent"] = result.achieved_prr
             point_records.append(point_record)
-            summaries.append(
-                {
-                    "file": str(csv_path),
-                    "solver_status": result.solver_status,
-                    "termination": result.solver_termination,
-                    "dli_target_found": result.dli_target_found,
-                    "dli_avg": result.dli_avg,
-                    "drr_percent": result.drr,
-                    "timeseries_csv": timeseries_path,
-                }
-            )
+            summaries.append({
+                "file": str(csv_path),
+                "solver_status": result.solver_status,
+                "termination": result.solver_termination,
+                "baseline_power_mwh": baseline_power / 1e6,
+                "achieved_power_mwh": float(np.sum(result.power_w)) / 1e6,
+                "power_ratio_percent": result.achieved_prr,
+                "dli_target_found": result.dli_target_found,
+                "dli_avg": result.dli_avg,
+                "timeseries_csv": timeseries_path,
+            })
+
         else:
-            # Forward mode: solve directly
+            # Forward mode: Input DLI -> Compute Power
             print(f"  Running optimization solver (DLI={config.control.dli_target})...")
             try:
-                result = solve_for_weather(csv_path, metadata, weather_data, config, args.solver, args.solver_executable)
-                print(f"  Complete! PRR={result.prr:.2f}%")
+                result = solve_for_weather(
+                    csv_path, metadata, weather_data, config, args.solver, args.solver_executable
+                )
+                achieved_power = float(np.sum(result.power_w))
+                power_ratio = (achieved_power / baseline_power * 100.0) if baseline_power > 0 else 0.0
+                dli_avg = float(np.mean(result.dli_series))
+
+                # Update result with power-based metrics
+                result.baseline_cf = baseline_cf
+                result.prr = power_ratio
+                result.achieved_prr = power_ratio
+                result.dli_avg = dli_avg
+
+                print(f"  Complete! Power: {achieved_power/1e6:.4f} MWh ({power_ratio:.2f}% of baseline)")
+                print(f"  DLI avg: {dli_avg:.2f} mol/m²/day")
+
                 timeseries_path, point_record = write_outputs(
                     result, output_dir, reverse_mode=False, dli_target_used=config.control.dli_target
                 )
+                # Override with power-based fields
+                point_record["baseline_power_mwh"] = baseline_power / 1e6
+                point_record["achieved_power_mwh"] = achieved_power / 1e6
+                point_record["power_ratio_percent"] = power_ratio
                 point_records.append(point_record)
-                summaries.append(
-                    {
-                        "file": str(csv_path),
-                        "solver_status": result.solver_status,
-                        "termination": result.solver_termination,
-                        "prr_percent": result.prr,
-                        "dli_avg": point_record.get("dli_avg", 0.0),
-                        "drr_percent": point_record.get("drr_percent", 0.0),
-                        "timeseries_csv": timeseries_path,
-                    }
-                )
+                summaries.append({
+                    "file": str(csv_path),
+                    "solver_status": result.solver_status,
+                    "termination": result.solver_termination,
+                    "baseline_power_mwh": baseline_power / 1e6,
+                    "achieved_power_mwh": achieved_power / 1e6,
+                    "power_ratio_percent": power_ratio,
+                    "dli_input": config.control.dli_target,
+                    "dli_avg": dli_avg,
+                    "timeseries_csv": timeseries_path,
+                })
             except RuntimeError as e:
                 print(f"  Skipped! Solver failed: {e}")
-                # Record failed point
-                summaries.append(
-                    {
-                        "file": str(csv_path),
-                        "solver_status": "failed",
-                        "termination": "infeasible",
-                        "prr_percent": None,
-                        "dli_avg": None,
-                        "drr_percent": None,
-                        "timeseries_csv": "",
-                    }
-                )
+                summaries.append({
+                    "file": str(csv_path),
+                    "solver_status": "failed",
+                    "termination": "infeasible",
+                    "baseline_power_mwh": baseline_power / 1e6,
+                    "achieved_power_mwh": None,
+                    "power_ratio_percent": None,
+                    "dli_input": config.control.dli_target,
+                    "dli_avg": None,
+                    "timeseries_csv": "",
+                })
 
     summary_df = pd.DataFrame(summaries)
     summary_path = output_dir / "summary.csv"
@@ -1492,11 +1662,7 @@ def main() -> None:
 
     if point_records:
         point_df = pd.DataFrame(point_records)
-        # Select output filename based on mode
-        if reverse_mode:
-            point_path = output_dir / "points_dli.csv"
-        else:
-            point_path = output_dir / "points_prr.csv"
+        point_path = output_dir / ("points_dli.csv" if reverse_mode else "points_power.csv")
         point_df.to_csv(point_path, index=False)
     else:
         point_path = None
