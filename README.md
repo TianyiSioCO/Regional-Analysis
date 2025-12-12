@@ -20,17 +20,24 @@ Recommended: Use the repository's virtual environment (Python 3.10+)
 
 ```Terminal
 # Windows
-conda activate base
+conda create --name <env_name>
 
 # Linux/Mac
-conda activate base
+conda create --name <env_name>
 ```
 
 ### 2. Dependencies
 
 ```bash
-conda install numpy pandas pvlib pyomo matplotlib
+conda install numpy pandas matplotlib
 ```
+
+```bash
+pip install pvlib
+conda install conda-forge::pyomo
+```
+
+
 
 ### 3. Nonlinear Solver
 
