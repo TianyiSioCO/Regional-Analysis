@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <title>Agrivoltaic Analysis Map (Projection Fixed)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+  <link rel="stylesheet" href="https://js.arcgis.com/4.31/esri/themes/light/main.css" />
+
+  <style>
+    html,
+    body,
+    #viewDiv {
+      padding: 0;
+      margin: 0;
+      height: 100%;
+      width: 100%;
+      font-family: "Segoe UI", sans-serif;
+    }
+
+    #loading-overlay {
+      position: absolute;
+      inset: 0;
+      background: rgba(15, 23, 42, 0.85);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: white;
+      z-index: 2000;
+    }
+
+    #loading-overlay.hidden {
+      display: none;
+    }
+
+    #control-panel {
+      position: absolute;
+      bottom: 20px;
+      right: 20px;
+      background: white;
+      padding: 12px 14px;
+      border-radius: 8px;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+      font-size: 12px;
+      z-index: 1000;
+      width: 200px;
+    }
+
+    #control-panel label {
+      display: block;
+      margin-bottom: 10px;
+      color: #333;
+    }
+
+    #control-panel input[type="range"] {
+      width: 100%;
+    }
+
+    #control-panel button {
+      width: 100%;
+      padding: 6px;
+      cursor: pointer;
+    }
+
+    #legend {
+      position: absolute;
+      top: 20px;
+      right: 20px;
+      background: white;
+      padding: 12px 14px;
+      border-radius: 8px;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+      font-family: sans-serif;
+      font-size: 12px;
+      z-index: 1000;
+      width: 150px;
+    }
+
+    #legend-title {
+      font-weight: 600;
+      margin-bottom: 6px;
+    }
+
+    #legend-content {
+      display: flex;
+    }
+
+    #legend-bar {
+      width: 18px;
+      height: 160px;
+      border-radius: 3px;
+      background: linear-gradient(to top,
+          rgb(255, 255, 204),
+          rgb(194, 230, 153),
+          rgb(120, 198, 121),
+          rgb(49, 163, 84),
+          rgb(0, 104, 55));
+    }
+
+    #legend-labels {
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      margin-left: 8px;
+      height: 160px;
+      color: #333;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="viewDiv"></div>
+
+  <div id="loading-overlay">Rendering…</div>
+
+  <div id="control-panel">
+    <label>
+      Radius: <span id="radius-value">10 km</span>
+      <input id="radius" type="range" min="5" max="30" value="10" />
+    </label>
+
+    <label>
+      Opacity: <span id="opacity-value">0.85</span>
+      <input id="opacity" type="range" min="10" max="100" value="85" />
+    </label>
+
+    <label>
+      Resolution: <span id="resolution-value">700</span>
+      <input id="resolution" type="range" min="400" max="1200" step="100" value="700" />
+    </label>
+
+    <button id="refresh">Refresh Render</button>
+  </div>
+
+  <div id="legend">
+    <div id="legend-title">Power Ratio (%)</div>
+    <div id="legend-content">
+      <div id="legend-bar"></div>
+      <div id="legend-labels"></div>
+    </div>
+  </div>
+
+  <script type="module">
+    /* -------------------------------------------------------------------------- */
+    /*                                ESRI IMPORTS                                 */
+    /* -------------------------------------------------------------------------- */
+
+    import Map from "https://js.arcgis.com/4.31/@arcgis/core/Map.js";
+    import MapView from "https://js.arcgis.com/4.31/@arcgis/core/views/MapView.js";
+    import ScaleBar from "https://js.arcgis.com/4.31/@arcgis/core/widgets/ScaleBar.js";
+    import Extent from "https://js.arcgis.com/4.31/@arcgis/core/geometry/Extent.js";
+    import Point from "https://js.arcgis.com/4.31/@arcgis/core/geometry/Point.js";
+    import SpatialReference from "https://js.arcgis.com/4.31/@arcgis/core/geometry/SpatialReference.js";
+    import * as projection from "https://js.arcgis.com/4.31/@arcgis/core/geometry/projection.js";
+    import MediaLayer from "https://js.arcgis.com/4.31/@arcgis/core/layers/MediaLayer.js";
+    import ImageElement from "https://js.arcgis.com/4.31/@arcgis/core/layers/support/ImageElement.js";
+    import ExtentAndRotationGeoreference from
+      "https://js.arcgis.com/4.31/@arcgis/core/layers/support/ExtentAndRotationGeoreference.js";
+
+    /* -------------------------------------------------------------------------- */
+    /*                                CONFIGURATION                                */
+    /* -------------------------------------------------------------------------- */
+
+    const CSV_PATH = "./output/points_prr.csv";
+    const PROJECTED_SR = new SpatialReference({ wkid: 32618 });
+
+    const config = {
+      radiusKm: 10,
+      opacity: 0.85,
+      resolution: 700,
+      power: 2
+    };
+
+    const COLORS = [
+      [255, 255, 204],
+      [194, 230, 153],
+      [120, 198, 121],
+      [49, 163, 84],
+      [0, 104, 55]
+    ];
+
+    /* -------------------------------------------------------------------------- */
+    /*                                   STATE                                     */
+    /* -------------------------------------------------------------------------- */
+
+    let projectedPoints = [];
+    let rasterExtent = null;
+    let colorStops = [];
+    let mediaLayer = null;
+    let map;
+
+    /* -------------------------------------------------------------------------- */
+    /*                                   UTILS                                     */
+    /* -------------------------------------------------------------------------- */
+
+    const loading = document.getElementById("loading-overlay");
+    const showLoading = () => loading.classList.remove("hidden");
+    const hideLoading = () => loading.classList.add("hidden");
+
+    function planarDistance(x1, y1, x2, y2) {
+      return Math.hypot(x2 - x1, y2 - y1);
+    }
+
+    function generateColorStops(min, max) {
+      const step = (max - min) / (COLORS.length - 1);
+      return COLORS.map((c, i) => ({
+        value: min + step * i,
+        color: c
+      }));
+    }
+
+    function valueToColor(value) {
+      if (value === null) return [0, 0, 0, 0];
+      for (let i = 0; i < colorStops.length - 1; i++) {
+        const a = colorStops[i];
+        const b = colorStops[i + 1];
+        if (value <= a.value) return [...a.color, 255];
+        if (value <= b.value) {
+          const t = (value - a.value) / (b.value - a.value);
+          return [
+            Math.round(a.color[0] + t * (b.color[0] - a.color[0])),
+            Math.round(a.color[1] + t * (b.color[1] - a.color[1])),
+            Math.round(a.color[2] + t * (b.color[2] - a.color[2])),
+            255
+          ];
+        }
+      }
+      return [...colorStops.at(-1).color, 255];
+    }
+
+    function updateLegend() {
+      const labels = document.getElementById("legend-labels");
+      labels.innerHTML = "";
+      for (let i = colorStops.length - 1; i >= 0; i--) {
+        const v = colorStops[i].value;
+        const d = document.createElement("div");
+        d.textContent = Number.isInteger(v) ? v : v.toFixed(1);
+        labels.appendChild(d);
+      }
+    }
+
+    /* -------------------------------------------------------------------------- */
+    /*                               DATA LOADING                                  */
+    /* -------------------------------------------------------------------------- */
+
+    async function loadCSV(path) {
+      const text = await (await fetch(path)).text();
+      const lines = text.trim().split(/\r?\n/);
+      const headers = lines[0].split(",");
+
+      const lonIdx = headers.indexOf("longitude");
+      const latIdx = headers.indexOf("latitude");
+      const valIdx = headers.indexOf("prr_percent");
+
+      return lines.slice(1).map(l => {
+        const c = l.split(",");
+        return { lon: +c[lonIdx], lat: +c[latIdx], value: +c[valIdx] };
+      });
+    }
+
+    async function projectPoints(points) {
+      await projection.load();
+      return points.map(p => {
+        const geo = new Point({
+          longitude: p.lon,
+          latitude: p.lat,
+          spatialReference: { wkid: 4326 }
+        });
+        const prj = projection.project(geo, PROJECTED_SR);
+        return { x: prj.x, y: prj.y, value: p.value };
+      });
+    }
+
+    /* -------------------------------------------------------------------------- */
+    /*                              IDW + RASTER                                   */
+    /* -------------------------------------------------------------------------- */
+
+    function idw(x, y) {
+      const r = config.radiusKm * 1000;
+      let wSum = 0, vSum = 0;
+
+      for (const p of projectedPoints) {
+        const d = planarDistance(x, y, p.x, p.y);
+        if (d < 1) return p.value;
+        if (d <= r) {
+          const w = 1 / Math.pow(d, config.power);
+          wSum += w;
+          vSum += w * p.value;
+        }
+      }
+      return wSum ? vSum / wSum : null;
+    }
+
+    async function generateRaster() {
+      const size = config.resolution;
+      const canvas = document.createElement("canvas");
+      canvas.width = size;
+      canvas.height = size;
+
+      const ctx = canvas.getContext("2d");
+      const img = ctx.createImageData(size, size);
+
+      const dx = (rasterExtent.xmax - rasterExtent.xmin) / size;
+      const dy = (rasterExtent.ymax - rasterExtent.ymin) / size;
+
+      for (let y = 0; y < size; y++) {
+        const py = rasterExtent.ymax - y * dy;
+        for (let x = 0; x < size; x++) {
+          const px = rasterExtent.xmin + x * dx;
+          const val = idw(px, py);
+          const [R, G, B, A] = valueToColor(val);
+          const i = (y * size + x) * 4;
+          img.data[i] = R;
+          img.data[i + 1] = G;
+          img.data[i + 2] = B;
+          img.data[i + 3] = Math.round(A * config.opacity);
+        }
+      }
+
+      ctx.putImageData(img, 0, 0);
+      return canvas.toDataURL("image/png");
+    }
+
+    async function renderRaster() {
+      showLoading();
+      if (mediaLayer) map.remove(mediaLayer);
+
+      const image = await generateRaster();
+
+      mediaLayer = new MediaLayer({
+        source: [
+          new ImageElement({
+            image,
+            georeference: new ExtentAndRotationGeoreference({
+              extent: rasterExtent
+            })
+          })
+        ]
+      });
+
+      map.add(mediaLayer, 0);
+      hideLoading();
+    }
+
+    /* -------------------------------------------------------------------------- */
+    /*                                   MAIN                                      */
+    /* -------------------------------------------------------------------------- */
+
+    (async () => {
+      const raw = await loadCSV(CSV_PATH);
+      projectedPoints = await projectPoints(raw);
+
+      const values = projectedPoints.map(p => p.value);
+      colorStops = generateColorStops(Math.min(...values), Math.max(...values));
+      updateLegend();
+
+      let xmin = Infinity, ymin = Infinity, xmax = -Infinity, ymax = -Infinity;
+      for (const p of projectedPoints) {
+        xmin = Math.min(xmin, p.x);
+        ymin = Math.min(ymin, p.y);
+        xmax = Math.max(xmax, p.x);
+        ymax = Math.max(ymax, p.y);
+      }
+
+      const pad = config.radiusKm * 1000;
+      rasterExtent = new Extent({
+        xmin: xmin - pad,
+        ymin: ymin - pad,
+        xmax: xmax + pad,
+        ymax: ymax + pad,
+        spatialReference: PROJECTED_SR
+      });
+
+      map = new Map({ basemap: "gray-vector" });
+
+      const view = new MapView({
+        container: "viewDiv",
+        map,
+        center: [-75, 43],
+        zoom: 6
+      });
+
+      view.ui.add(new ScaleBar({ view, unit: "dual" }), "bottom-left");
+
+      await view.when();
+      await renderRaster();
+    })();
+
+    /* -------------------------------------------------------------------------- */
+    /*                                   UI                                        */
+    /* -------------------------------------------------------------------------- */
+
+    document.getElementById("radius").oninput = e => {
+      config.radiusKm = +e.target.value;
+      document.getElementById("radius-value").textContent = `${config.radiusKm} km`;
+    };
+
+    document.getElementById("opacity").oninput = e => {
+      config.opacity = +e.target.value / 100;
+      document.getElementById("opacity-value").textContent =
+        config.opacity.toFixed(2);
+    };
+
+    document.getElementById("resolution").oninput = e => {
+      config.resolution = +e.target.value;
+      document.getElementById("resolution-value").textContent =
+        config.resolution;
+    };
+
+    document.getElementById("refresh").onclick = renderRaster;
+
+  </script>
+</body>
+
+</html>
