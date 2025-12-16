@@ -19,7 +19,7 @@ References:
   - NSRDB TMY (Typical Meteorological Year) data format
   - pvlib solar position algorithms
 
-Author: Cornell EERL TZ
+Author: Agritrack Research Team
 """
 from __future__ import annotations
 
@@ -1253,7 +1253,7 @@ def search_dli_for_target_power_ratio(
     target_power = baseline_power * target_power_ratio
     print(f"  Baseline Power: {baseline_power/1e6:.2f} MWh")
     print(f"  Target Power Ratio: {target_power_ratio*100:.1f}% -> Target Power: {target_power/1e6:.2f} MWh")
-    print(f"  DLI search range: [{dli_min}, {dli_max}] mol/m²/day")
+    print(f"  DLI search range: [{dli_min}, {dli_max}] mol/m2/day")
 
     low, high = dli_min, dli_max
     best_result: Optional[AgritrackResult] = None
@@ -1369,7 +1369,7 @@ def write_outputs(
     else:
         # Forward mode (DLI -> PRR): output Power map fields
         # DRR = actual average DLI / target DLI × 100
-        dli_target = dli_target_used if dli_target_used else 30.0
+        dli_target = dli_target_used if dli_target_used is not None else 30.0
         drr = (dli_avg / dli_target) * 100.0 if dli_target > 0 else 0.0
         point_record = {
             "latitude": latitude,
@@ -1428,14 +1428,15 @@ def parse_arguments() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Forward mode: Input DLI=25, output power generation
-  python main.py --forward --dli-target 25
+  # Reverse mode (default): Find DLI for 80% of baseline (ST) power
+  python AnalyzeData/main.py
 
-  # Reverse mode: Find DLI for 80%% of baseline power
-  python main.py --target-power-ratio 0.8
+  # Forward mode: Input DLI=30, output power ratio vs baseline (ST)
+  python AnalyzeData/main.py --forward --dli-target 30
 
-  # Reverse mode with custom search range
-  python main.py --target-power-ratio 0.8 --dli-min 10 --dli-max 40
+  # Reverse mode: Custom target power (0-1 ratio or 0-100 percent)
+  python AnalyzeData/main.py --target-power 0.75
+  python AnalyzeData/main.py --target-power 75
         """
     )
 
@@ -1460,7 +1461,7 @@ Examples:
     )
     parser.add_argument(
         "--output-dir",
-        default=str(Path("AnalyzeData/output")),
+        default=str(script_dir / "output"),
         help="Output directory for results",
     )
     parser.add_argument(
@@ -1479,14 +1480,19 @@ Examples:
     mode_group.add_argument(
         "--forward",
         action="store_true",
-        help="Forward mode: Input DLI -> Output Power (default if --target-power-ratio not set)",
+        help="Forward mode: Input DLI -> Output power ratio vs baseline ST",
     )
     mode_group.add_argument(
+        "--target-power",
         "--target-power-ratio",
+        dest="target_power_ratio",
         type=float,
-        default=None,
+        default=0.8,
         metavar="RATIO",
-        help="Reverse mode: Target power ratio (0-1), e.g., 0.8 = 80%% of ST baseline power",
+        help=(
+            "Reverse mode: target power ratio vs baseline ST. "
+            "Accepts 0-1 ratio or 0-100 percent (default: 0.8)."
+        ),
     )
 
     # Forward mode parameters
@@ -1494,9 +1500,9 @@ Examples:
     forward_group.add_argument(
         "--dli-target",
         type=float,
-        default=30.0,
+        default=20,
         metavar="DLI",
-        help="DLI target value (mol/m²/day), default 30",
+        help="DLI target value (mol/m2/day), default 20",
     )
 
     # Reverse mode parameters
@@ -1506,14 +1512,14 @@ Examples:
         type=float,
         default=15.0,
         metavar="MIN",
-        help="Lower bound for DLI search (mol/m²/day), default 15",
+        help="Lower bound for DLI search (mol/m2/day), default 15",
     )
     reverse_group.add_argument(
         "--dli-max",
         type=float,
         default=50.0,
         metavar="MAX",
-        help="Upper bound for DLI search (mol/m²/day), default 50",
+        help="Upper bound for DLI search (mol/m2/day), default 50",
     )
     reverse_group.add_argument(
         "--tolerance",
@@ -1542,26 +1548,86 @@ def main() -> None:
     summaries = []
     point_records = []
 
-    # Simplified mode selection: power_ratio (reverse) vs forward
-    # - Reverse mode: Input target power ratio -> Search DLI
-    # - Forward mode: Input DLI -> Compute Power
-    reverse_mode = args.target_power_ratio is not None
+    script_dir = Path(__file__).parent
+
+    def resolve_input_path(path_text: str) -> Path:
+        """Resolve an input CSV path."""
+        candidate = Path(path_text)
+        if candidate.exists():
+            return candidate
+        if not candidate.is_absolute():
+            candidate_from_script = script_dir / candidate
+            if candidate_from_script.exists():
+                return candidate_from_script
+        raise FileNotFoundError(f"Input file not found: {path_text}")
+
+    def normalize_target_power_ratio(raw: float) -> float:
+        """Normalize target power ratio.
+
+        Accepts:
+          - 0-1 ratio (e.g., 0.8)
+          - 0-100 percent (e.g., 80)
+        """
+        ratio = float(raw)
+        if ratio > 1.0:
+            ratio = ratio / 100.0
+        if ratio <= 0.0 or ratio > 1.0:
+            raise ValueError(f"Invalid target power ratio: {raw}. Expected 0-1 or 0-100.")
+        return ratio
+
+    # Scheme 2:
+    # - Default: Reverse mode (target power ratio -> search DLI)
+    # - Forward:  --forward (input DLI -> compute power ratio vs baseline ST)
+    reverse_mode = not args.forward
+    target_power_ratio = normalize_target_power_ratio(args.target_power_ratio)
 
     if reverse_mode:
-        print(f"=== Reverse Mode: Target Power Ratio {args.target_power_ratio*100:.1f}% -> Search DLI ===")
+        print(f"=== Reverse Mode: Target Power Ratio {target_power_ratio*100:.1f}% -> Search DLI ===")
         print(f"  Baseline: Standard Tracking (ST) power generation")
-        print(f"  DLI search range: [{args.dli_min}, {args.dli_max}] mol/m²/day")
+        print(f"  DLI search range: [{args.dli_min}, {args.dli_max}] mol/m2/day")
         print(f"  Tolerance: {args.tolerance}%")
     else:
         print(f"=== Forward Mode: Input DLI={args.dli_target} -> Compute Power ===")
         print(f"  Baseline: Standard Tracking (ST) power generation")
 
     for idx, input_path in enumerate(args.inputs, 1):
-        csv_path = Path(input_path)
-        if not csv_path.exists():
-            raise FileNotFoundError(f"Input file not found: {csv_path}")
+        try:
+            csv_path = resolve_input_path(input_path)
+        except FileNotFoundError as error:
+            print(f"\n[{idx}/{len(args.inputs)}] Skipped! {error}")
+            summaries.append({
+                "file": str(input_path),
+                "solver_status": "failed",
+                "termination": "error",
+                "baseline_power_mwh": None,
+                "achieved_power_mwh": None,
+                "power_ratio_percent": None,
+                "dli_input": (config.control.dli_target if not reverse_mode else None),
+                "dli_target_found": None,
+                "dli_avg": None,
+                "timeseries_csv": "",
+            })
+            continue
 
-        metadata, weather_data, updated_location = load_weather_data(csv_path, LocationConfig())
+        try:
+            metadata, weather_data, updated_location = load_weather_data(
+                csv_path, LocationConfig()
+            )
+        except Exception as error:
+            print(f"\n[{idx}/{len(args.inputs)}] Skipped! Failed to load {csv_path}: {error}")
+            summaries.append({
+                "file": str(csv_path),
+                "solver_status": "failed",
+                "termination": "error",
+                "baseline_power_mwh": None,
+                "achieved_power_mwh": None,
+                "power_ratio_percent": None,
+                "dli_input": (config.control.dli_target if not reverse_mode else None),
+                "dli_target_found": None,
+                "dli_avg": None,
+                "timeseries_csv": "",
+            })
+            continue
         config.location = updated_location
         print(f"\n[{idx}/{len(args.inputs)}] Loaded file: {csv_path}")
         print(f"  Location: ({updated_location.latitude}, {updated_location.longitude})")
@@ -1570,20 +1636,53 @@ def main() -> None:
 
         # Always compute baseline power using Standard Tracking (ST)
         print("  Computing baseline power (Standard Tracking mode)...")
-        baseline_power, baseline_cf, _ = compute_baseline_power(metadata, weather_data, config)
+        try:
+            baseline_power, baseline_cf, _ = compute_baseline_power(
+                metadata, weather_data, config
+            )
+        except Exception as error:
+            print(f"  Skipped! Baseline computation failed: {error}")
+            summaries.append({
+                "file": str(csv_path),
+                "solver_status": "failed",
+                "termination": "error",
+                "baseline_power_mwh": None,
+                "achieved_power_mwh": None,
+                "power_ratio_percent": None,
+                "dli_input": (config.control.dli_target if not reverse_mode else None),
+                "dli_target_found": None,
+                "dli_avg": None,
+                "timeseries_csv": "",
+            })
+            continue
         print(f"  Baseline Power (ST): {baseline_power/1e6:.4f} MWh, CF: {baseline_cf:.2f}%")
 
         if reverse_mode:
             # Reverse mode: Input target power ratio -> Search DLI
-            print(f"  Searching for DLI that achieves {args.target_power_ratio*100:.1f}% power ratio...")
-            result = search_dli_for_target_power_ratio(
-                csv_path, metadata, weather_data, config,
-                args.solver, args.solver_executable,
-                baseline_power, args.target_power_ratio,
-                args.dli_min, args.dli_max,
-                args.tolerance / 100.0,
-                args.max_iter
-            )
+            print(f"  Searching for DLI that achieves {target_power_ratio*100:.1f}% power ratio...")
+            try:
+                result = search_dli_for_target_power_ratio(
+                    csv_path, metadata, weather_data, config,
+                    args.solver, args.solver_executable,
+                    baseline_power, target_power_ratio,
+                    args.dli_min, args.dli_max,
+                    args.tolerance / 100.0,
+                    args.max_iter
+                )
+            except Exception as error:
+                print(f"  Skipped! Reverse search failed: {error}")
+                summaries.append({
+                    "file": str(csv_path),
+                    "solver_status": "failed",
+                    "termination": "failed",
+                    "baseline_power_mwh": baseline_power / 1e6,
+                    "achieved_power_mwh": None,
+                    "power_ratio_percent": None,
+                    "dli_target_found": None,
+                    "dli_avg": None,
+                    "timeseries_csv": "",
+                })
+                continue
 
             timeseries_path, point_record = write_outputs(result, output_dir, reverse_mode=True)
             point_record["baseline_power_mwh"] = baseline_power / 1e6
@@ -1620,7 +1719,7 @@ def main() -> None:
                 result.dli_avg = dli_avg
 
                 print(f"  Complete! Power: {achieved_power/1e6:.4f} MWh ({power_ratio:.2f}% of baseline)")
-                print(f"  DLI avg: {dli_avg:.2f} mol/m²/day")
+                print(f"  DLI avg: {dli_avg:.2f} mol/m2/day")
 
                 timeseries_path, point_record = write_outputs(
                     result, output_dir, reverse_mode=False, dli_target_used=config.control.dli_target
@@ -1641,12 +1740,12 @@ def main() -> None:
                     "dli_avg": dli_avg,
                     "timeseries_csv": timeseries_path,
                 })
-            except RuntimeError as e:
-                print(f"  Skipped! Solver failed: {e}")
+            except Exception as error:
+                print(f"  Skipped! Solver failed: {error}")
                 summaries.append({
                     "file": str(csv_path),
                     "solver_status": "failed",
-                    "termination": "infeasible",
+                    "termination": "failed",
                     "baseline_power_mwh": baseline_power / 1e6,
                     "achieved_power_mwh": None,
                     "power_ratio_percent": None,
