@@ -1,11 +1,11 @@
 """
-批量下载美国本土（CONUS）NSRDB 太阳辐射数据
-支持两种模式：
-  1. TMY 模式：下载典型气象年数据（年份来源可能不统一）
-  2. PSM 单年模式：下载指定年份的实际数据（所有点位时间轴一致）
+Batch download NSRDB solar radiation data for the Contiguous United States (CONUS)
+Supports two modes:
+  1. TMY mode: Download Typical Meteorological Year data (source years may vary)
+  2. PSM Single Year mode: Download actual data for a specific year (consistent timeline for all points)
 
-使用多边形定义边界，生成网格坐标点，逐点请求下载
-边界数据来源: https://raw.githubusercontent.com/johan/world.geo.json/master/countries/USA.geo.json
+Uses a polygon to define boundaries, generates grid coordinate points, and requests downloads point by point.
+Boundary data source: https://raw.githubusercontent.com/johan/world.geo.json/master/countries/USA.geo.json
 """
 
 import requests
@@ -17,25 +17,25 @@ import json
 import threading
 from queue import Queue
 
-# ============ 配置参数 ============
-# 数据模式选择
-# - "tmy": 下载 TMY 典型气象年数据（默认，但年份来源可能不统一）
-# - "single_year": 下载指定单年的 PSM 数据（推荐，时间轴统一）
-DATA_MODE = "single_year"  # 可选: "tmy" 或 "single_year"
+# ============ Configuration Parameters ============
+# Data Mode Selection
+# - "tmy": Download TMY Typical Meteorological Year data (Default, but source years may vary)
+# - "single_year": Download PSM data for a specific year (Recommended, consistent timeline)
+DATA_MODE = "single_year"  # Options: "tmy" or "single_year"
 
-# 单年模式的年份设置（DATA_MODE="single_year" 时生效）
-# 可用年份范围：1998-2023（美国大陆）
-SINGLE_YEAR = 2020  # 推荐选择一个气象正常的年份
+# Year setting for Single Year mode (Effective when DATA_MODE="single_year")
+# Available range: 1998-2023 (CONUS)
+SINGLE_YEAR = 2020  # Recommended to choose a year with normal meteorological conditions
 
-# API 端点配置
-# 注意：使用 .csv 直接下载模式，避免异步 ZIP 模式的 404 问题
+# API Endpoint Configuration
+# Note: Use .csv direct download mode to avoid 404 issues with asynchronous ZIP mode
 API_ENDPOINTS = {
     "tmy": "https://developer.nrel.gov/api/nsrdb/v2/solar/nsrdb-GOES-tmy-v4-0-0-download.csv",
     "single_year": "https://developer.nrel.gov/api/nsrdb/v2/solar/nsrdb-GOES-aggregated-v4-0-0-download.csv",
 }
 
-# 多 API Key 配置 - 支持多个凭证轮换使用
-# 注意：NREL API 对邮箱验证变严格，需要使用有意义的邮箱格式
+# Multi-API Key Configuration - Supports rotation of multiple credentials
+# Note: NREL API email validation is strict; use meaningful email formats
 API_CREDENTIALS = [
     {"api_key": "aubcOxuI74skYBd80St05JVm0zdhtjDzV0RLObUL", "email": "solar.data.user1@outlook.com"},
     {"api_key": "0EuGhvS3LTYgI90EkLbtgg0IkIw20jxgyWrGn7qY", "email": "nsrdb.download2@outlook.com"},
@@ -67,14 +67,14 @@ API_CREDENTIALS = [
     },
 ]
 
-# API Key 冷却配置
-COOLDOWN_DURATION = 60  # 单个 Key 冷却时间(秒)
-ALL_KEYS_COOLDOWN_WAIT = 30  # 所有 Key 都冷却时的等待时间(秒)
+# API Key Cooldown Configuration
+COOLDOWN_DURATION = 60  # Cooldown time for a single Key (seconds)
+ALL_KEYS_COOLDOWN_WAIT = 30  # Wait time when all Keys are cooling down (seconds)
 
-# 美国本土（CONUS - Contiguous United States）简化边界多边形顶点 (经度, 纬度)
-# 数据来源: https://raw.githubusercontent.com/johan/world.geo.json/master/countries/USA.geo.json
-# 经度范围: 约 -124.69 到 -66.96
-# 纬度范围: 约 25.08 到 49.39
+# Simplified polygon vertices for the Contiguous United States (CONUS) (Longitude, Latitude)
+# Data source: https://raw.githubusercontent.com/johan/world.geo.json/master/countries/USA.geo.json
+# Longitude range: approx -124.69 to -66.96
+# Latitude range: approx 25.08 to 49.39
 US_MAINLAND_POLYGON = [
     (-94.81758, 49.38905),
     (-94.64, 48.84),
@@ -308,33 +308,33 @@ US_MAINLAND_POLYGON = [
     (-97.22872, 49.0007),
     (-95.15907, 49),
     (-95.15609, 49.38425),
-    (-94.81758, 49.38905),  # 闭合多边形
+    (-94.81758, 49.38905),  # Closed polygon
 ]
 
 
 
-# 网格分辨率 (度) - 0.095° ≈ 9.2km，约 1700 个点
+# Grid Resolution (degrees) - 0.095° ≈ 9.2km, approx 1700 points
 GRID_RESOLUTION = 0.9
 
-# 输出目录
+# Output Directory
 OUTPUT_DIR = Path(__file__).parent.parent / "AnalyzeData" / "data"
 
-# 下载限制
-MAX_POINTS = None  # 设为 None 表示不限制，按实际多边形范围生成所有点
-REQUEST_INTERVAL = 2.1  # 请求间隔(秒)，API要求每2秒1次
-DOWNLOAD_INITIAL_WAIT = 10  # 首次下载等待时间(秒) - 多Key并发可以缩短
-DOWNLOAD_RETRY_WAIT = 3  # 重试等待时间(秒) - 快速轮询检查
-MAX_DOWNLOAD_RETRIES = 100  # 最大重试次数 - 等待时间短了，重试次数增加
-DOWNLOAD_THREADS = 10  # 并行下载线程数 - 多Key支持更高并发
+# Download Limits
+MAX_POINTS = None  # Set to None for no limit, generates all points within polygon range
+REQUEST_INTERVAL = 2.1  # Request interval (seconds), API requires 1 per 2 seconds
+DOWNLOAD_INITIAL_WAIT = 10  # Initial wait time for download (seconds)
+DOWNLOAD_RETRY_WAIT = 3  # Retry wait time (seconds)
+MAX_DOWNLOAD_RETRIES = 100  # Max retries
+DOWNLOAD_THREADS = 10  # Parallel download threads
 # ==================================
 
 
 class ApiKeyManager:
     """
-    API Key 轮换管理器
-    - 支持多个 API Key 轮换使用
-    - 遇到 429/400 错误时自动切换并标记冷却
-    - 所有 Key 冷却时等待后重试
+    API Key Rotation Manager
+    - Supports rotation of multiple API Keys
+    - Automatically switches and marks cooldown on 429/400 errors
+    - Waits if all Keys are in cooldown
     """
 
     def __init__(self, credentials):
@@ -344,24 +344,24 @@ class ApiKeyManager:
         self.lock = threading.Lock()
 
     def get_current(self):
-        """获取当前可用的 API Key 和邮箱"""
+        """Get currently available API Key and email"""
         with self.lock:
             return self._get_available_credential()
 
     def _get_available_credential(self):
-        """内部方法：获取可用凭证，如果全部冷却则等待"""
+        """Internal method: Get available credential, wait if all are cooling down"""
         while True:
             now = time.time()
             available_indices = []
 
-            # 找出所有可用的 Key
+            # Find all available Keys
             for i in range(len(self.credentials)):
                 cooldown_end = self.cooldown_until.get(i, 0)
                 if now >= cooldown_end:
                     available_indices.append(i)
 
             if available_indices:
-                # 优先使用当前索引，如果不可用则用第一个可用的
+                # Prioritize current index, otherwise use first available
                 if self.current_index in available_indices:
                     idx = self.current_index
                 else:
@@ -375,53 +375,53 @@ class ApiKeyManager:
                     "email": cred["email"],
                 }
             else:
-                # 所有 Key 都在冷却，等待后重试
+                # All Keys are in cooldown, wait and retry
                 min_wait = min(self.cooldown_until.values()) - now
                 wait_time = max(min_wait, ALL_KEYS_COOLDOWN_WAIT)
-                print(f"\n⚠️  所有 API Key 都在冷却中，等待 {wait_time:.0f} 秒后重试...")
+                print(f"\n⚠️  All API Keys are in cooldown, waiting {wait_time:.0f} seconds to retry...")
                 self.lock.release()
                 time.sleep(wait_time)
                 self.lock.acquire()
 
     def mark_cooldown(self, index):
-        """将指定 Key 标记为冷却状态"""
+        """Mark specific Key as cooling down"""
         with self.lock:
             self.cooldown_until[index] = time.time() + COOLDOWN_DURATION
-            print(f"  ⏸️  API Key #{index + 1} 进入冷却期 ({COOLDOWN_DURATION}秒)")
+            print(f"  ⏸️  API Key #{index + 1} entered cooldown ({COOLDOWN_DURATION}s)")
 
     def switch_to_next(self, silent=True):
         """
-        切换到下一个可用的 Key
-        silent: 静默模式，不打印切换信息（正常轮换时使用）
+        Switch to the next available Key
+        silent: If true, suppresses switching info (used for normal rotation)
         """
         with self.lock:
             self.current_index = (self.current_index + 1) % len(self.credentials)
             if not silent:
-                print(f"  🔄 切换到 API Key #{self.current_index + 1}")
+                print(f"  🔄 Switched to API Key #{self.current_index + 1}")
 
     def get_status(self):
-        """获取所有 Key 的状态"""
+        """Get status of all Keys"""
         with self.lock:
             now = time.time()
             status = []
             for i, cred in enumerate(self.credentials):
                 cooldown_end = self.cooldown_until.get(i, 0)
                 if now >= cooldown_end:
-                    status.append(f"Key#{i+1}: 可用")
+                    status.append(f"Key#{i+1}: Available")
                 else:
                     remaining = int(cooldown_end - now)
-                    status.append(f"Key#{i+1}: 冷却中({remaining}s)")
+                    status.append(f"Key#{i+1}: Cooldown({remaining}s)")
             return ", ".join(status)
 
 
-# 全局 API Key 管理器实例
+# Global instance of API Key Manager
 api_key_manager = ApiKeyManager(API_CREDENTIALS)
 
 
 def point_in_polygon(lon, lat, polygon):
     """
-    射线法判断点是否在多边形内
-    polygon: [(lon1, lat1), (lon2, lat2), ...] 的列表
+    Ray-casting algorithm to determine if a point is inside a polygon
+    polygon: list of [(lon1, lat1), (lon2, lat2), ...]
     """
     n = len(polygon)
     inside = False
@@ -444,7 +444,7 @@ def point_in_polygon(lon, lat, polygon):
 
 
 def get_polygon_bounds(polygon):
-    """获取多边形的边界框"""
+    """Get bounding box of a polygon"""
     lons = [p[0] for p in polygon]
     lats = [p[1] for p in polygon]
     return {
@@ -457,8 +457,8 @@ def get_polygon_bounds(polygon):
 
 def generate_grid_points_in_polygon(polygon, resolution, max_points=None):
     """
-    在多边形范围内生成网格坐标点
-    max_points: 最大点数限制，None 表示不限制（按实际多边形范围生成所有点）
+    Generate grid coordinate points within polygon range
+    max_points: Max points limit, None means no limit
     """
     bounds = get_polygon_bounds(polygon)
     points = []
@@ -467,10 +467,10 @@ def generate_grid_points_in_polygon(polygon, resolution, max_points=None):
     while lat <= bounds["lat_max"]:
         lon = bounds["lon_min"]
         while lon <= bounds["lon_max"]:
-            # 只保留在多边形内的点
+            # Keep only points inside the polygon
             if point_in_polygon(lon, lat, polygon):
                 points.append((round(lat, 2), round(lon, 2)))
-                # 仅当设置了 max_points 时才检查限制
+                # Check limit only if max_points is set
                 if max_points is not None and len(points) >= max_points:
                     return points
             lon += resolution
@@ -481,36 +481,36 @@ def generate_grid_points_in_polygon(polygon, resolution, max_points=None):
 
 def get_api_config():
     """
-    根据 DATA_MODE 返回对应的 API 端点和 names 参数
+    Returns API endpoint and names parameters based on DATA_MODE
     """
     if DATA_MODE == "single_year":
         return {
             "url": API_ENDPOINTS["single_year"],
-            "names": str(SINGLE_YEAR),  # 单年模式：使用具体年份
+            "names": str(SINGLE_YEAR),  # Single year mode: use specific year
         }
-    else:  # tmy 模式
+    else:  # tmy mode
         return {
             "url": API_ENDPOINTS["tmy"],
-            "names": "tmy-2024",  # TMY 模式：使用 tmy-2024
+            "names": "tmy-2024",  # TMY mode: use tmy-2024
         }
 
 
 def request_download_link(lat, lon):
     """
-    请求单个坐标点的数据
-    使用 CSV 直接下载模式（同步），返回 CSV 内容而不是下载链接
-    支持多 API Key 轮换
+    Request data for a single coordinate point
+    Uses CSV direct download mode (synchronous), returns CSV content
+    Supports multi-API Key rotation
     """
     api_config = get_api_config()
 
-    while True:  # 持续重试直到成功
-        # 获取当前可用的 API Key
+    while True:  # Continue retrying until success
+        # Get currently available API Key
         cred = api_key_manager.get_current()
         api_key = cred["api_key"]
         email = cred["email"]
         key_index = cred["index"]
 
-        # CSV 直接下载使用 GET 请求，参数放在 URL 中
+        # CSV direct download uses GET request, parameters in URL
         params = {
             "api_key": api_key,
             "wkt": f"POINT({lon} {lat})",
@@ -526,23 +526,20 @@ def request_download_link(lat, lon):
                 api_config["url"],
                 params=params,
                 headers={"x-api-key": api_key},
-                timeout=120,  # CSV 下载可能需要更长时间
+                timeout=120,  # CSV download might take longer
             )
 
             if response.status_code == 200:
                 content_type = response.headers.get("Content-Type", "").lower()
-                # 接受 csv、text、octet-stream 等格式
-                # 有些环境下 API 会返回 binary/octet-stream 但实际内容是 CSV
+                # Accept csv, text, octet-stream etc.
                 if "csv" in content_type or "text" in content_type or "octet-stream" in content_type:
-                    # 尝试获取内容
                     try:
-                        # 如果是 octet-stream，尝试解码为文本
                         if "octet-stream" in content_type:
                             content = response.content.decode("utf-8")
                         else:
                             content = response.text
 
-                        # 验证是否为有效的 CSV 格式（检查是否包含逗号分隔的数据行）
+                        # Validate valid CSV format
                         if content and ("," in content or "\n" in content):
                             api_key_manager.switch_to_next()
                             return content, None, key_index + 1
@@ -551,16 +548,15 @@ def request_download_link(lat, lon):
                     except UnicodeDecodeError:
                         return None, f"Cannot decode content as UTF-8", key_index + 1
                 else:
-                    # 返回了非 CSV 内容，可能是错误
                     return None, f"Unexpected content type: {content_type}", key_index + 1
 
             elif response.status_code in (429, 400):
-                # 速率限制或请求错误
+                # Rate limit or request error
                 error_text = response.text[:200] if response.text else str(response.status_code)
                 if "email" in error_text.lower():
-                    print(f"  ⚠️  API Key #{key_index + 1} 邮箱验证失败")
+                    print(f"  ⚠️  API Key #{key_index + 1} Email validation failed")
                 else:
-                    print(f"  ⚠️  API Key #{key_index + 1} 遇到 HTTP {response.status_code}")
+                    print(f"  ⚠️  API Key #{key_index + 1} encountered HTTP {response.status_code}")
                 api_key_manager.mark_cooldown(key_index)
                 api_key_manager.switch_to_next(silent=False)
                 continue
@@ -574,7 +570,7 @@ def request_download_link(lat, lon):
 
 def download_and_extract(item, output_dir, print_lock):
     """
-    实时检测并下载解压单个文件
+    Real-time detection and download extraction for a single file
     """
     lat, lon, url = item["lat"], item["lon"], item["url"]
     zip_path = output_dir / f"temp_{lat}_{lon}.zip"
@@ -594,23 +590,20 @@ def download_and_extract(item, output_dir, print_lock):
                 content_type = response.headers.get("Content-Type", "").lower()
 
                 if "zip" in content_type or "octet-stream" in content_type:
-                    # 下载文件
                     with open(zip_path, "wb") as f:
                         for chunk in response.iter_content(chunk_size=8192):
                             if chunk:
                                 f.write(chunk)
 
-                    # 解压
                     try:
                         with zipfile.ZipFile(zip_path, "r") as zip_ref:
                             file_list = zip_ref.namelist()
                             zip_ref.extractall(output_dir)
 
-                        # 删除ZIP
                         zip_path.unlink()
 
                         csv_count = len([f for f in file_list if f.endswith(".csv")])
-                        return True, f"{csv_count} 个CSV"
+                        return True, f"{csv_count} CSVs"
 
                     except zipfile.BadZipFile:
                         if zip_path.exists():
@@ -620,7 +613,7 @@ def download_and_extract(item, output_dir, print_lock):
                     if attempt % 10 == 0:
                         with print_lock:
                             print(
-                                f"      [{lat}, {lon}] 等待数据准备... (重试 {attempt})"
+                                f"      [{lat}, {lon}] Waiting for data preparation... (Retry {attempt})"
                             )
                     continue
 
@@ -634,11 +627,11 @@ def download_and_extract(item, output_dir, print_lock):
         except Exception:
             continue
 
-    return False, "超过最大重试次数"
+    return False, "Exceeded max retries"
 
 
 def download_worker(download_queue, output_dir, results, print_lock, stop_event):
-    """下载工作线程"""
+    """Download working thread"""
     while not stop_event.is_set():
         try:
             item = download_queue.get(timeout=2)
@@ -651,11 +644,11 @@ def download_worker(download_queue, output_dir, results, print_lock, stop_event)
                 results["total"] += 1
                 if success:
                     results["success"] += 1
-                    print(f"  ✓ 下载完成 ({item['lat']}, {item['lon']}) - {msg}")
+                    print(f"  ✓ Download complete ({item['lat']}, {item['lon']}) - {msg}")
                 else:
                     results["failed"] += 1
                     results["failed_items"].append(item)
-                    print(f"  ✗ 下载失败 ({item['lat']}, {item['lon']}) - {msg}")
+                    print(f"  ✗ Download failed ({item['lat']}, {item['lon']}) - {msg}")
 
             download_queue.task_done()
 
@@ -664,7 +657,7 @@ def download_worker(download_queue, output_dir, results, print_lock, stop_event)
 
 
 def save_progress(progress_file, results, pending_count):
-    """保存进度"""
+    """Save progress"""
     with open(progress_file, "w", encoding="utf-8") as f:
         json.dump(
             {
@@ -681,53 +674,53 @@ def save_progress(progress_file, results, pending_count):
 
 
 def main():
-    # 获取当前模式配置
+    # Get current mode configuration
     api_config = get_api_config()
 
     print("=" * 70)
     if DATA_MODE == "single_year":
-        print(f"美国本土 NSRDB PSM 单年数据批量下载 (年份: {SINGLE_YEAR})")
-        print("  ✓ 所有点位使用相同年份，时间轴统一")
+        print(f"NSRDB PSM Single Year Batch Download for CONUS (Year: {SINGLE_YEAR})")
+        print("  ✓ All points use the same year, timeline consistent")
     else:
-        print("美国本土 NSRDB TMY 数据批量下载 (典型气象年)")
-        print("  ⚠️ 注意: TMY 数据各点位年份来源可能不一致")
+        print("NSRDB TMY Batch Download for CONUS (Typical Meteorological Year)")
+        print("  ⚠️ Note: TMY source years may vary by point")
     print("=" * 70)
-    print(f"数据模式: {DATA_MODE.upper()}")
-    print(f"API 端点: {api_config['url'].split('/')[-1]}")
-    print(f"names 参数: {api_config['names']}")
-    print(f"输出目录: {OUTPUT_DIR}")
+    print(f"Data Mode: {DATA_MODE.upper()}")
+    print(f"API Endpoint: {api_config['url'].split('/')[-1]}")
+    print(f"Names Parameter: {api_config['names']}")
+    print(f"Output Directory: {OUTPUT_DIR}")
     print(
-        f"最大下载点数: {'不限制 (按实际范围)' if MAX_POINTS is None else MAX_POINTS}"
+        f"Max Points: {'Unlimited (Actual Range)' if MAX_POINTS is None else MAX_POINTS}"
     )
-    print(f"网格分辨率: {GRID_RESOLUTION} 度")
-    print(f"请求间隔: {REQUEST_INTERVAL} 秒")
-    print(f"并行下载线程: {DOWNLOAD_THREADS}")
-    print(f"API Key 数量: {len(API_CREDENTIALS)} 个")
+    print(f"Grid Resolution: {GRID_RESOLUTION} degrees")
+    print(f"Request Interval: {REQUEST_INTERVAL} seconds")
+    print(f"Parallel Download Threads: {DOWNLOAD_THREADS}")
+    print(f"API Key Count: {len(API_CREDENTIALS)} units")
     for i, cred in enumerate(API_CREDENTIALS):
         masked_key = cred["api_key"][:8] + "..." + cred["api_key"][-4:]
         print(f"  Key#{i+1}: {masked_key} ({cred['email']})")
     print()
 
-    # 确保输出目录存在
+    # Ensure output directory exists
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     progress_file = Path(__file__).parent / "batch_progress.json"
 
-    # 生成坐标点 (仅多边形内的点)
-    print("生成网格坐标点 (仅美国本土多边形范围内)...")
+    # Generate points (only inside polygon)
+    print("Generating grid points (Contiguous US polygon range only)...")
     bounds = get_polygon_bounds(US_MAINLAND_POLYGON)
     print(
-        f"  多边形边界框: 经度 [{bounds['lon_min']:.2f}, {bounds['lon_max']:.2f}], 纬度 [{bounds['lat_min']:.2f}, {bounds['lat_max']:.2f}]"
+        f"  Polygon BBox: Lon [{bounds['lon_min']:.2f}, {bounds['lon_max']:.2f}], Lat [{bounds['lat_min']:.2f}, {bounds['lat_max']:.2f}]"
     )
 
     points = generate_grid_points_in_polygon(US_MAINLAND_POLYGON, GRID_RESOLUTION, MAX_POINTS)
-    print(f"  多边形内共生成 {len(points)} 个有效坐标点")
+    print(f"  Generated {len(points)} valid points within polygon")
     print()
 
-    # CSV 直接下载模式：同步下载，无需异步队列
+    # CSV direct mode: synchronous download, no async queue needed
     results = {"total": 0, "success": 0, "failed": 0, "failed_items": []}
 
-    print("开始下载数据（CSV 直接模式）...")
+    print("Starting data download (CSV Direct Mode)...")
     print("-" * 70)
 
     try:
@@ -737,8 +730,8 @@ def main():
             results["total"] += 1
 
             if csv_content:
-                # 直接保存 CSV 文件
-                # 从 CSV 内容中提取 location_id（第二行第二列）
+                # Save CSV file directly
+                # Extract location_id (row 2, column 2)
                 try:
                     lines = csv_content.strip().split('\n')
                     if len(lines) >= 2:
@@ -749,12 +742,12 @@ def main():
                 except Exception:
                     location_id = f"{lat}_{lon}"
 
-                # 生成文件名
+                # Generate filename
                 year_suffix = api_config["names"]
                 filename = f"{location_id}_{lat}_{lon}_{year_suffix}.csv"
                 filepath = OUTPUT_DIR / filename
 
-                # 保存文件
+                # Save file
                 with open(filepath, "w", encoding="utf-8") as f:
                     f.write(csv_content)
 
@@ -764,39 +757,39 @@ def main():
             else:
                 results["failed"] += 1
                 results["failed_items"].append({"lat": lat, "lon": lon, "error": str(error)})
-                print(f"[{i+1}/{len(points)}] ({lat}, {lon}) [Key#{used_key}] - 失败: {error}")
+                print(f"[{i+1}/{len(points)}] ({lat}, {lon}) [Key#{used_key}] - Failed: {error}")
 
-            # 每50个保存一次进度
+            # Save progress every 50 points
             if (i + 1) % 50 == 0:
                 save_progress(progress_file, results, len(points) - i - 1)
 
-            # API限流
+            # API Throttling
             time.sleep(REQUEST_INTERVAL)
 
     except KeyboardInterrupt:
-        print("\n\n收到中断信号，正在停止...")
+        print("\n\nInterrupt received, stopping...")
 
-    # 最终保存进度
+    # Final progress save
     save_progress(progress_file, results, 0)
 
     print()
     print("=" * 70)
-    print("全部完成!")
-    print(f"  成功: {results['success']}, 失败: {results['failed']}")
-    print(f"  输出目录: {OUTPUT_DIR}")
+    print("Task Completed!")
+    print(f"  Success: {results['success']}, Failed: {results['failed']}")
+    print(f"  Output Directory: {OUTPUT_DIR}")
     print("=" * 70)
 
-    # 统计CSV文件
+    # Count CSV files
     csv_files = list(OUTPUT_DIR.glob("*.csv"))
-    print(f"\n目录中共有 {len(csv_files)} 个 CSV 文件")
+    print(f"\nTotal CSV files in directory: {len(csv_files)}")
 
-    # 如果有失败的，打印出来
+    # Print failed items if any
     if results["failed_items"]:
-        print(f"\n失败的下载 ({len(results['failed_items'])} 个):")
+        print(f"\nFailed Downloads ({len(results['failed_items'])} items):")
         for item in results["failed_items"][:10]:
             print(f"  ({item['lat']}, {item['lon']}): {item.get('error', 'unknown')}")
         if len(results["failed_items"]) > 10:
-            print(f"  ... 还有 {len(results['failed_items']) - 10} 个")
+            print(f"  ... and {len(results['failed_items']) - 10} more")
 
 
 if __name__ == "__main__":
