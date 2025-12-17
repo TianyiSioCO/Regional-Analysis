@@ -19,11 +19,12 @@ References:
   - NSRDB TMY (Typical Meteorological Year) data format
   - pvlib solar position algorithms
 
-Author: Agritrack Research Team
+Author: EERL TZ
 """
 from __future__ import annotations
 
 import argparse
+import copy
 from dataclasses import dataclass, field
 from itertools import zip_longest
 from pathlib import Path
@@ -330,10 +331,20 @@ COLUMN_ALIASES: Dict[str, str] = {
     "precipitation": "precipitation",
 }
 
+# Floating point tolerance for percentage ratios (avoid values like 100.00000000000003)
+RATIO_PERCENT_CLAMP_EPS = 1e-9
+
 
 # =============================================================================
 # Utility Functions
 # =============================================================================
+
+def _clamp_ratio_percent(ratio_percent: float, upper: float = 100.0) -> float:
+    """Clamp a percent value to an upper bound within a small numeric tolerance."""
+    if ratio_percent > upper and ratio_percent <= upper + RATIO_PERCENT_CLAMP_EPS:
+        return upper
+    return ratio_percent
+
 
 def _to_timezone(timestamp: pd.Timestamp, timezone: str) -> pd.Timestamp:
     """Convert timestamp to specified timezone."""
@@ -477,16 +488,19 @@ def load_weather_data(
     data = data.set_index("datetime").sort_index()
     data.index = data.index.tz_localize(timezone)
 
-    # Automatically determine time range (defaults to full year)
+    # Automatically determine time range (defaults to May 1 to Aug 31)
     start_ts = location.start_timestamp(timezone)
     end_ts = location.end_timestamp(timezone)
 
     if start_ts is None or end_ts is None:
-        # Use actual time range from data
-        start_ts = data.index.min()
-        end_ts = data.index.max()
+        # Default to growing season for the dataset year.
+        dataset_year = int(data.index.min().year)
+        start_ts = _to_timezone(pd.Timestamp(dataset_year, 5, 1, 0, 0, 0), timezone)
+        end_ts = _to_timezone(pd.Timestamp(dataset_year, 8, 31, 23, 59, 59), timezone)
 
     filtered = data.loc[(data.index >= start_ts) & (data.index <= end_ts)]
+    if filtered.empty:
+        raise ValueError(f"{path} has no data in selected time range: {start_ts} ~ {end_ts}")
 
     required = ["dni", "dhi", "ghi", "temperature"]
     missing = [col for col in required if col not in filtered.columns]
@@ -1060,7 +1074,7 @@ def compute_baseline_power(
     weather_data: pd.DataFrame,
     config: AgritrackConfig,
 ) -> Tuple[float, float, np.ndarray]:
-    """Compute baseline power using Standard Tracking (ST) mode.
+    """Compute analytical power using Standard Tracking (ST) angles.
 
     Standard Tracking follows the optimal sun-tracking angle without any DLI constraints,
     representing the theoretical maximum power generation for the system.
@@ -1212,6 +1226,49 @@ def compute_baseline_power(
     return total_power, capacity_factor, power_values
 
 
+def compute_baseline_power_optimized(
+    source: Path,
+    metadata: Dict[str, str],
+    weather_data: pd.DataFrame,
+    config: AgritrackConfig,
+    solver_name: str,
+    solver_executable: Optional[str],
+) -> Tuple[float, float, np.ndarray]:
+    """Compute baseline power via unconstrained optimization (Standard Tracking baseline).
+
+    Baseline is defined as the maximum achievable power generation at the location when
+    tracker angles are optimized to maximize power WITHOUT crop constraints (no DLI/biomass).
+
+    This guarantees that any constrained run (with DLI/biomass) cannot exceed the baseline,
+    except for negligible numerical tolerance.
+
+    Args:
+        source: Path to CSV file
+        metadata: Metadata dictionary
+        weather_data: Weather data DataFrame
+        config: Configuration object
+        solver_name: Pyomo solver name (e.g., 'ipopt')
+        solver_executable: Optional path to solver executable
+
+    Returns:
+        Tuple of (baseline_power_wh, baseline_cf_percent, power_array)
+        - baseline_power_wh: Total power generation in Wh
+        - baseline_cf_percent: Capacity factor as percentage
+        - power_array: Hourly power values [W]
+    """
+    baseline_config = copy.deepcopy(config)
+    baseline_config.tracking.strategy = "dynamic"
+    baseline_config.control.criteria = "dli"
+    baseline_config.control.dli_target = 0.0
+
+    result = solve_for_weather(
+        source, metadata, weather_data, baseline_config, solver_name, solver_executable
+    )
+    baseline_power = float(np.sum(result.power_w))
+    baseline_cf = float(result.capacity_factor)
+    return baseline_power, baseline_cf, result.power_w
+
+
 def search_dli_for_target_power_ratio(
     source: Path,
     metadata: Dict[str, str],
@@ -1238,7 +1295,7 @@ def search_dli_for_target_power_ratio(
         config: Base configuration
         solver_name: Solver name
         solver_executable: Optional path to solver executable
-        baseline_power: Baseline total power from standard tracking [Wh]
+        baseline_power: Baseline total power from unconstrained optimized baseline [Wh]
         target_power_ratio: Target ratio (0-1), e.g., 0.8 = 80% of baseline
         dli_min: Lower bound for DLI search
         dli_max: Upper bound for DLI search
@@ -1248,8 +1305,6 @@ def search_dli_for_target_power_ratio(
     Returns:
         AgritrackResult containing search results
     """
-    import copy
-
     target_power = baseline_power * target_power_ratio
     print(f"  Baseline Power: {baseline_power/1e6:.2f} MWh")
     print(f"  Target Power Ratio: {target_power_ratio*100:.1f}% -> Target Power: {target_power/1e6:.2f} MWh")
@@ -1309,8 +1364,9 @@ def search_dli_for_target_power_ratio(
     # Update result object
     best_result.baseline_cf = (baseline_power / (len(best_result.power_w) * config.power.pdc0)) * 100 if len(best_result.power_w) > 0 else 0.0
     best_result.target_prr = target_power_ratio * 100  # Store as percentage for compatibility
-    best_result.achieved_prr = achieved_ratio * 100
-    best_result.prr = achieved_ratio * 100
+    achieved_prr_percent = _clamp_ratio_percent(achieved_ratio * 100.0)
+    best_result.achieved_prr = achieved_prr_percent
+    best_result.prr = achieved_prr_percent
     best_result.dli_target_found = best_dli
     best_result.dli_avg = dli_avg
     best_result.drr = drr
@@ -1428,10 +1484,10 @@ def parse_arguments() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Reverse mode (default): Find DLI for 80% of baseline (ST) power
+  # Reverse mode (default): Find DLI for 80% of baseline power (unconstrained optimized baseline)
   python AnalyzeData/main.py
 
-  # Forward mode: Input DLI=30, output power ratio vs baseline (ST)
+  # Forward mode: Input DLI=30, output power ratio vs baseline (unconstrained optimized baseline)
   python AnalyzeData/main.py --forward --dli-target 30
 
   # Reverse mode: Custom target power (0-1 ratio or 0-100 percent)
@@ -1480,7 +1536,7 @@ Examples:
     mode_group.add_argument(
         "--forward",
         action="store_true",
-        help="Forward mode: Input DLI -> Output power ratio vs baseline ST",
+        help="Forward mode: Input DLI -> Output power ratio vs baseline (unconstrained optimized baseline)",
     )
     mode_group.add_argument(
         "--target-power",
@@ -1490,7 +1546,7 @@ Examples:
         default=0.8,
         metavar="RATIO",
         help=(
-            "Reverse mode: target power ratio vs baseline ST. "
+            "Reverse mode: target power ratio vs baseline (unconstrained optimized baseline). "
             "Accepts 0-1 ratio or 0-100 percent (default: 0.8)."
         ),
     )
@@ -1577,18 +1633,18 @@ def main() -> None:
 
     # Scheme 2:
     # - Default: Reverse mode (target power ratio -> search DLI)
-    # - Forward:  --forward (input DLI -> compute power ratio vs baseline ST)
+    # - Forward:  --forward (input DLI -> compute power ratio vs baseline)
     reverse_mode = not args.forward
     target_power_ratio = normalize_target_power_ratio(args.target_power_ratio)
 
     if reverse_mode:
         print(f"=== Reverse Mode: Target Power Ratio {target_power_ratio*100:.1f}% -> Search DLI ===")
-        print(f"  Baseline: Standard Tracking (ST) power generation")
+        print("  Baseline: Unconstrained power-maximizing optimization (Standard Tracking baseline)")
         print(f"  DLI search range: [{args.dli_min}, {args.dli_max}] mol/m2/day")
         print(f"  Tolerance: {args.tolerance}%")
     else:
         print(f"=== Forward Mode: Input DLI={args.dli_target} -> Compute Power ===")
-        print(f"  Baseline: Standard Tracking (ST) power generation")
+        print("  Baseline: Unconstrained power-maximizing optimization (Standard Tracking baseline)")
 
     for idx, input_path in enumerate(args.inputs, 1):
         try:
@@ -1634,11 +1690,16 @@ def main() -> None:
         print(f"  Timezone: {updated_location.timezone}")
         print(f"  Time range: {updated_location.start} ~ {updated_location.end}")
 
-        # Always compute baseline power using Standard Tracking (ST)
-        print("  Computing baseline power (Standard Tracking mode)...")
+        # Always compute baseline power using unconstrained optimization (Standard Tracking baseline)
+        print("  Computing baseline power (Unconstrained optimization / Standard Tracking baseline)...")
         try:
-            baseline_power, baseline_cf, _ = compute_baseline_power(
-                metadata, weather_data, config
+            baseline_power, baseline_cf, _ = compute_baseline_power_optimized(
+                csv_path,
+                metadata,
+                weather_data,
+                config,
+                args.solver,
+                args.solver_executable,
             )
         except Exception as error:
             print(f"  Skipped! Baseline computation failed: {error}")
@@ -1655,7 +1716,7 @@ def main() -> None:
                 "timeseries_csv": "",
             })
             continue
-        print(f"  Baseline Power (ST): {baseline_power/1e6:.4f} MWh, CF: {baseline_cf:.2f}%")
+        print(f"  Baseline Power: {baseline_power/1e6:.4f} MWh, CF: {baseline_cf:.2f}%")
 
         if reverse_mode:
             # Reverse mode: Input target power ratio -> Search DLI
@@ -1710,6 +1771,7 @@ def main() -> None:
                 )
                 achieved_power = float(np.sum(result.power_w))
                 power_ratio = (achieved_power / baseline_power * 100.0) if baseline_power > 0 else 0.0
+                power_ratio = _clamp_ratio_percent(power_ratio)
                 dli_avg = float(np.mean(result.dli_series))
 
                 # Update result with power-based metrics
