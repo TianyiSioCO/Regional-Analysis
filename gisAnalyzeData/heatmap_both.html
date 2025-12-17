@@ -26,7 +26,7 @@
     #info-panel p { margin: 0 0 0.35rem; }
     .error { padding: 12px; background: #fee2e2; color: #991b1b; border-radius: 6px; border: 1px solid #fca5a5; }
 
-    /* 加载提示 */
+    /* Loading */
     #loading-overlay {
       position: absolute;
       top: 0;
@@ -58,7 +58,7 @@
       font-size: 14px;
     }
 
-    /* 自定义图例样式 */
+    /* Image custom */
     #custom-legend {
       position: absolute;
       top: 15px;
@@ -123,7 +123,7 @@
       line-height: 1;
     }
 
-    /* 控制面板 */
+    /* Control panel */
     #control-panel {
       position: absolute;
       bottom: 30px;
@@ -155,13 +155,13 @@
 <body>
   <div id="viewDiv"></div>
 
-  <!-- 加载提示 -->
+  <!-- Loading notification -->
   <div id="loading-overlay">
     <div class="spinner"></div>
     <div id="loading-text">Loading data...</div>
   </div>
 
-  <!-- 自定义图例 -->
+  <!-- custom -->
   <div id="custom-legend">
     <h4 id="legend-title">DLI (mol/m²/day)</h4>
     <div class="legend-content">
@@ -180,7 +180,7 @@
     </div>
   </div>
 
-  <!-- 控制面板 -->
+  <!-- Control panel -->
   <div id="control-panel">
     <label>
       Radius: <span id="radius-value" class="value">150 km</span>
@@ -224,30 +224,30 @@
     }
 
     const params = new URLSearchParams(window.location.search);
-    // 默认文件：正向模式输出 points_power.csv，反向模式输出 points_dli.csv
+    // read：forward output is points_power.csv，backward output is points_dli.csv
     const csvPath = params.get("file") || "./output/points_power.csv";
 
-    // 全局变量
+    // variables
     let dataPoints = [];
     let projectedPoints = [];
-    // 地图类型: "dli" (反向模式，显示 DLI 目标值) 或 "power" (正向模式，显示功率比例)
+    // Map type: dli (backward) or power (forward，%PRR)
     let mapType = "power";
     let view = null;
     let mediaLayer = null;
     let currentExtent = null;
     let rasterExtent = null;
 
-    // 配置参数
+    // Configurations
     const config = {
-      radiusKm: 150,      // 影响半径（公里）
-      opacity: 0.85,      // 透明度
-      resolution: 700,    // 分辨率（像素）
-      power: 2,           // IDW 幂次
+      radiusKm: 150,      // influence radius（km), if showing dots
+      opacity: 0.85,      // opacity, smaller to shown state boundaries
+      resolution: 700,    // resolution
+      power: 2,           // IDW 
     };
 
     const PROJECTED_SR = new SpatialReference({ wkid: 3857 });
 
-    // Viridis 颜色数组 (从低到高：紫→蓝→绿→黄)
+    // Viridis (low to high: purple→blue→green→yellow)
     const dliColors = [
       [68, 1, 84],
       [72, 40, 120],
@@ -260,7 +260,7 @@
       [253, 231, 37],
     ];
 
-    // Power Ratio 颜色数组 (从低到高：紫→蓝→绿→黄)
+    // Power Ratio (low to high：purple→blue→green→yellow)
     const powerColors = [
       [68, 1, 84],
       [72, 40, 120],
@@ -273,13 +273,13 @@
       [253, 231, 37],
     ];
 
-    // 动态生成的颜色停止点（加载数据后自动计算）
+    // color stop (auto)
     let dliColorStops = [];
     let powerColorStops = [];
     let dataMin = 0;
     let dataMax = 100;
 
-    // 根据数据范围生成颜色停止点
+    // legend range based on min/max
     function generateColorStops(colors, min, max) {
       const stops = [];
       const step = (max - min) / (colors.length - 1);
@@ -337,7 +337,7 @@
         maxLat = Math.max(maxLat, p.lat);
       }
 
-      const padding = config.radiusKm / 111; // 大约转换为度
+      const padding = config.radiusKm / 111; // to degrees
       return new Extent({
         xmin: minLon - padding,
         xmax: maxLon + padding,
@@ -367,20 +367,20 @@
       });
     }
 
-    // 检测地图类型
-    // - "dli": 反向模式输出，显示 dli_target_found (给定功率比例找到的 DLI)
-    // - "power": 正向模式输出，显示 power_ratio_percent (给定 DLI 得到的功率比例)
+    // map type:
+    // - dli: backward output，show dli_target_found (at given power ratio)
+    // - power: forward output，show power_ratio_percent (at given DLI)
     function detectMapType(headers) {
-      // 反向模式: 有 dli_target_found 字段
+      // backward: if include dli_target_found 
       if (headers.includes("dli_target_found")) return "dli";
-      // 正向模式: 有 power_ratio_percent 字段
+      // forward: if include power_ratio_percent
       if (headers.includes("power_ratio_percent")) return "power";
-      // 兼容旧格式
+      // accept PRR
       if (headers.includes("prr_percent")) return "power";
       return "power";
     }
 
-    // 加载 CSV
+    // load CSV
     async function loadCsv(path) {
       const response = await fetch(path);
       if (!response.ok) throw new Error(`Failed to load CSV: ${response.status}`);
@@ -406,17 +406,17 @@
         const lat = Number(record.latitude);
         if (Number.isNaN(lon) || Number.isNaN(lat)) continue;
 
-        // 根据地图类型选择要显示的值
+        // show results based on map type
         let value;
         if (mapType === "dli") {
-          // 反向模式: 显示找到的 DLI 目标值
+          // backward: show DLI target found
           value = Number(record.dli_target_found) || 0;
         } else {
-          // 正向模式: 显示功率比例
+          // forward: show power ratio 
           value = Number(record.power_ratio_percent) || Number(record.prr_percent) || 0;
         }
 
-        // 存储额外信息用于 popup
+        // save additional info for popup
         const extraInfo = {
           baseline_power: Number(record.baseline_power_mwh) || 0,
           achieved_power: Number(record.achieved_power_mwh) || 0,
@@ -425,17 +425,17 @@
 
         points.push({ lon, lat, value, ...extraInfo });
 
-        // 计算最小最大值
+        // calculate min/max
         if (value < minVal) minVal = value;
         if (value > maxVal) maxVal = value;
       }
 
-      // 保存数据范围并生成颜色停止点
+      // save data range
       dataMin = Math.floor(minVal);
       dataMax = Math.ceil(maxVal);
       console.log(`Data range: ${dataMin} - ${dataMax}, type: ${mapType}`);
 
-      // 根据数据类型生成颜色停止点
+      // color stop pts
       if (mapType === "dli") {
         dliColorStops = generateColorStops(dliColors, dataMin, dataMax);
       } else {
@@ -445,7 +445,7 @@
       return points;
     }
 
-    // 更新图例
+    // update image
     function updateLegend() {
       const legendTitle = document.getElementById("legend-title");
       const legendBar = document.getElementById("legend-bar");
@@ -453,24 +453,24 @@
       const mapTitle = document.getElementById("map-title");
       const mapDesc = document.getElementById("map-desc");
 
-      // 生成动态标签（从最大值到最小值）
+      // from max to min
       const colorStops = mapType === "dli" ? dliColorStops : powerColorStops;
       let labelsHtml = "";
       for (let i = colorStops.length - 1; i >= 0; i--) {
         const val = colorStops[i].value;
-        // 根据数值大小决定显示格式
+        // decide display based on value
         const displayVal = Number.isInteger(val) ? val : val.toFixed(1);
         labelsHtml += `<span>${displayVal}</span>\n`;
       }
 
       if (mapType === "power") {
-        // 正向模式: 输入 DLI -> 输出功率比例
+        // forward: input DLI -> output power ratio
         legendTitle.textContent = "Power Ratio (%)";
         legendBar.className = "legend-bar power";
         mapTitle.textContent = "Forward Mode: DLI → Power Ratio";
         mapDesc.textContent = "Shows the power ratio under a given DLI constraint.";
       } else {
-        // 反向模式: 输入功率比例 -> 输出 DLI
+        // backward: input power ratio -> output DLI
         legendTitle.textContent = "DLI (mol/m²/day)";
         legendBar.className = "legend-bar dli";
         mapTitle.textContent = "Reverse Mode: Power Ratio → DLI";
@@ -480,7 +480,7 @@
       legendLabels.innerHTML = labelsHtml;
     }
 
-    // IDW 插值
+    // IDW interpolation
     function idwInterpolate(x, y, points, radiusMeters, power) {
       let weightSum = 0;
       let valueSum = 0;
@@ -489,7 +489,7 @@
         const dist = planarDistance(x, y, p.x, p.y);
 
         if (dist < 1) {
-          // 非常接近某个点，直接返回该点的值
+          // if close to one pt，return this pt's value
           return p.value;
         }
 
@@ -503,11 +503,11 @@
       return weightSum ? valueSum / weightSum : null;
     }
 
-    // 值到颜色的映射
+    // value to color
     function valueToColor(value, colorStops) {
-      if (value === null) return [0, 0, 0, 0]; // 透明
+      if (value === null) return [0, 0, 0, 0]; // opacity
 
-      // 找到所在区间
+      // find range
       for (let i = 0; i < colorStops.length - 1; i++) {
         const low = colorStops[i];
         const high = colorStops[i + 1];
@@ -527,12 +527,12 @@
         }
       }
 
-      // 超过最大值
+      // over maximum
       const last = colorStops[colorStops.length - 1];
       return [...last.color, 255];
     }
 
-    // 构建空间索引（简单网格）- 使用普通对象避免与 ArcGIS Map 冲突
+    // spacial index (simple grid) avoid conflicts with ArcGIS Map
     function buildSpatialIndex(points, cellSize) {
       const index = {};
 
@@ -550,7 +550,7 @@
       return { index, cellSize };
     }
 
-    // 从空间索引查询附近点
+    // query pts with spacial index
     function queryNearbyPoints(x, y, spatialIndex, radiusMeters) {
       const { index, cellSize } = spatialIndex;
       const searchRadius = Math.ceil(radiusMeters / cellSize) + 1;
@@ -571,7 +571,7 @@
       return nearby;
     }
 
-    // 生成 IDW 栅格图像
+    // generate IDW raster
     async function generateIDWRaster(extent, width, height) {
       setLoadingText("Generating IDW raster...");
 
@@ -583,7 +583,7 @@
 
       const colorStops = mapType === "dli" ? dliColorStops : powerColorStops;
 
-      // 构建空间索引
+      // build spacial index
       const radiusMeters = config.radiusKm * 1000;
       const cellSize = Math.max(radiusMeters / 2, 1000);
       const spatialIndex = buildSpatialIndex(projectedPoints, cellSize);
@@ -596,26 +596,26 @@
       const dx = (xMax - xMin) / width;
       const dy = (yMax - yMin) / height;
 
-      // 分批处理以避免阻塞
+      // batch processing
       const batchSize = 1000;
       let processed = 0;
       const total = width * height;
       let nullCount = 0;
 
       for (let y = 0; y < height; y++) {
-        const py = yMax - y * dy; // 从上到下
+        const py = yMax - y * dy; // from top to bottom
 
         for (let x = 0; x < width; x++) {
           const px = xMin + x * dx;
 
-          // 查询附近点
+          // query nearby pts
           const nearby = queryNearbyPoints(px, py, spatialIndex, radiusMeters);
 
-          // IDW 插值
+          // IDW interpolation
           const value = idwInterpolate(px, py, nearby, radiusMeters, config.power);
           if (value === null) nullCount++;
 
-          // 转换为颜色
+          // convert to colors
           const color = valueToColor(value, colorStops);
 
           const idx = (y * width + x) * 4;
@@ -627,10 +627,10 @@
           processed++;
         }
 
-        // 每处理一定行数更新进度
+        // update
         if (y % 20 === 0) {
           setLoadingText(`Generating IDW raster... ${Math.round(y / height * 100)}%`);
-          await new Promise(r => setTimeout(r, 0)); // 让 UI 更新
+          await new Promise(r => setTimeout(r, 0)); // UI update
         }
       }
 
@@ -645,7 +645,7 @@
       return canvas.toDataURL("image/png");
     }
 
-    // 渲染 IDW 图层
+    // render IDW layer
     async function renderIDWLayer() {
       if (!view || dataPoints.length === 0 || projectedPoints.length === 0) return;
 
@@ -655,16 +655,16 @@
       currentExtent = computeGeoExtent(dataPoints);
       rasterExtent = computeRasterExtent(projectedPoints);
 
-      // 生成 IDW 栅格
+      // generate IDW raster
       const size = config.resolution;
       const imageUrl = await generateIDWRaster(rasterExtent, size, size);
 
-      // 移除旧图层
+      // remove old layer
       if (mediaLayer) {
         view.map.remove(mediaLayer);
       }
 
-      // 创建新的 MediaLayer
+      // create new MediaLayer
       const imageElement = new ImageElement({
         image: imageUrl,
         georeference: new ExtentAndRotationGeoreference({
@@ -678,12 +678,12 @@
         opacity: 1
       });
 
-      view.map.add(mediaLayer, 0); // 添加到底层
+      view.map.add(mediaLayer, 0); // add to the bottom layer
 
       hideLoading();
     }
 
-    // 初始化地图
+    // initialize map
     async function initMap() {
       setLoadingText("Loading CSV data...");
 
@@ -706,7 +706,7 @@
 
         setLoadingText("Initializing map...");
 
-        // 计算数据中心
+        // data center
         let sumLon = 0, sumLat = 0;
         for (const p of dataPoints) {
           sumLon += p.lon;
@@ -729,10 +729,10 @@
 
         await view.when();
 
-        // 渲染 IDW
+        // render IDW
         await renderIDWLayer();
 
-        // 跳转到数据范围
+        // data range
         if (currentExtent) {
           view.goTo(currentExtent.expand(1.2), { animate: false });
         }
@@ -745,7 +745,7 @@
       }
     }
 
-    // 绑定控制面板事件
+    // control panel events
     function setupControls() {
       const radiusSlider = document.getElementById("radius-slider");
       const radiusValue = document.getElementById("radius-value");
@@ -775,7 +775,7 @@
       });
     }
 
-    // 启动
+    // initiate
     setupControls();
     initMap();
   </script>
