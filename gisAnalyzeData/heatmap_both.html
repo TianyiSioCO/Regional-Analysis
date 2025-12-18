@@ -230,7 +230,7 @@
     // variables
     let dataPoints = [];
     let projectedPoints = [];
-    // Map type: dli (backward) or power (forward，%PRR)
+    // Map type: dli (reverse) or power (forward，%PRR)
     let mapType = "power";
     let view = null;
     let mediaLayer = null;
@@ -368,10 +368,10 @@
     }
 
     // map type:
-    // - dli: backward output，show dli_target_found (at given power ratio)
+    // - dli: reverse output，show dli_target_found (at given power ratio)
     // - power: forward output，show power_ratio_percent (at given DLI)
     function detectMapType(headers) {
-      // backward: if include dli_target_found 
+      // reverse: if include dli_target_found 
       if (headers.includes("dli_target_found")) return "dli";
       // forward: if include power_ratio_percent
       if (headers.includes("power_ratio_percent")) return "power";
@@ -409,7 +409,7 @@
         // show results based on map type
         let value;
         if (mapType === "dli") {
-          // backward: show DLI target found
+          // reverse: show DLI target found
           value = Number(record.dli_target_found) || 0;
         } else {
           // forward: show power ratio 

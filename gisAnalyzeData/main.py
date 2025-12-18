@@ -346,6 +346,15 @@ def _clamp_ratio_percent(ratio_percent: float, upper: float = 100.0) -> float:
     return ratio_percent
 
 
+
+def _n_days_from_index(index: pd.DatetimeIndex) -> int:
+    """Return number of unique (calendar) days in a timezone-aware hourly index."""
+    try:
+        n = int(pd.Index(index.normalize()).nunique())
+    except Exception:
+        n = 0
+    return max(1, n)
+
 def _to_timezone(timestamp: pd.Timestamp, timezone: str) -> pd.Timestamp:
     """Convert timestamp to specified timezone."""
     if timestamp.tzinfo is None:
@@ -574,6 +583,11 @@ def solve_for_weather(
         raise ValueError("Insufficient timesteps: need at least 2 data points")
     time_interval = (hourly_timesteps[1] - hourly_timesteps[0]).total_seconds()
 
+    # Number of simulation days (for DLI aggregation)
+    n_days_sim = int(pd.Index(hourly_timesteps.normalize()).nunique())
+    if n_days_sim <= 0:
+        n_days_sim = 1
+
     # -------------------------------------------------------------------------
     # Step 1: Calculate solar position using pvlib
     # θ_e = solar elevation angle, φ_a = solar azimuth angle
@@ -694,6 +708,15 @@ def solve_for_weather(
             n_days = day
             break
 
+
+    # If maturity is reached early, trim all daily arrays consistently
+    daily_srads = daily_srads[:n_days]
+    daily_min_temp = daily_min_temp[:n_days]
+    daily_max_temp = daily_max_temp[:n_days]
+    daily_mean_temp = daily_mean_temp[:n_days]
+    d_thermal_time = d_thermal_time[:n_days]
+    thermal_time = thermal_time[: n_days + 1]
+
     # Temperature stress factor: linear response between base and optimal temp
     temp_growth = np.clip(
         (daily_mean_temp - plant_cfg.base_temp)
@@ -764,8 +787,9 @@ def solve_for_weather(
         )
         # Fix angles for non-optimized strategies
         if tracking.strategy == "standard_tracking":
+            model.theta_fix = ConstraintList()
             for idx in range(len(hourly_timesteps)):
-                model.theta[idx].fix(angle_tracking[idx])
+                model.theta_fix.add(model.theta[idx] == angle_tracking[idx])
         elif tracking.strategy == "antitracking":
             for idx in range(len(hourly_timesteps)):
                 model.theta[idx].fix(angle_antitracking[idx])
@@ -851,7 +875,7 @@ def solve_for_weather(
         # Biomass constraint: final biomass ≥ requirement ratio × reference
         model.daily_radiation = Expression(
             range(n_days),
-            rule=lambda mdl, day: _daily_radiation_average(mdl, day, steps_per_day, time_interval),
+            rule=lambda mdl, day: _daily_radiation_average(mdl, day, steps_per_day, time_interval, len(hourly_timesteps)),
         )
         model.cumulative_biomass = Var(range(n_days + 1), initialize=plant_cfg.initial_biomass)
         model.cumulative_biomass_constraints = ConstraintList()
@@ -879,14 +903,16 @@ def solve_for_weather(
             rule=lambda mdl, t: mdl.ground_radiation[t]
             * weather_cfg.ratio_par
             * weather_cfg.qc_par
-            * 24
-            * 3600
+            * time_interval
             / 1e6,
         )
         model.dli_constraint = Constraint(
-            expr=sum(model.dli_expr[t] for t in range(len(hourly_timesteps))) / len(hourly_timesteps)
+            expr=sum(model.dli_expr[t] for t in range(len(hourly_timesteps))) / n_days_sim
             >= control.dli_target
         )
+    elif control.criteria == "none":
+        # No crop constraint (baseline/unconstrained run)
+        pass
     else:
         raise ValueError(f"Unknown crop constraint type: {control.criteria}")
 
@@ -1027,8 +1053,7 @@ def solve_for_weather(
                 value(model.ground_radiation[idx])
                 * weather_cfg.ratio_par
                 * weather_cfg.qc_par
-                * 24
-                * 3600
+                * time_interval
                 / 1e6
             )
             for idx in range(len(hourly_timesteps))
@@ -1040,9 +1065,10 @@ def solve_for_weather(
             [float(value(model.cumulative_biomass[idx])) for idx in range(n_days + 1)]
         )
 
-    total_power = float(np.sum(power_values))
+    energy_wh = float(np.sum(power_values) * time_interval / 3600.0)
     capacity_factor = (
-        total_power / (len(power_values) * power_cfg.pdc0) * 100 if len(power_values) else 0.0
+        energy_wh / (power_cfg.pdc0 * (len(power_values) * time_interval / 3600.0)) * 100
+        if len(power_values) else 0.0
     )
     prr = capacity_factor
 
@@ -1062,10 +1088,14 @@ def solve_for_weather(
     )
 
 
-def _daily_radiation_average(model: ConcreteModel, day: int, steps_per_day: float, time_interval: float):
-    start_idx = round(day * steps_per_day)
-    end_idx = round((day + 1) * steps_per_day)
-    duration = (end_idx - start_idx) * time_interval
+def _daily_radiation_average(model: ConcreteModel, day: int, steps_per_day: float, time_interval: float, n_steps: int):
+    start_idx = int(round(day * steps_per_day))
+    end_idx = int(round((day + 1) * steps_per_day))
+    # Clamp indices to available timesteps
+    start_idx = max(0, min(start_idx, n_steps))
+    end_idx = max(start_idx, min(end_idx, n_steps))
+    duration = max((end_idx - start_idx) * time_interval, 1e-9)
+    # model.ground_radiation_plant is MJ/m^2 per timestep; average to MJ/m^2/day
     return sum(model.ground_radiation_plant[t] for t in range(start_idx, end_idx)) / (duration / 86400)
 
 
@@ -1257,16 +1287,17 @@ def compute_baseline_power_optimized(
         - power_array: Hourly power values [W]
     """
     baseline_config = copy.deepcopy(config)
-    baseline_config.tracking.strategy = "dynamic"
-    baseline_config.control.criteria = "dli"
+    baseline_config.tracking.strategy = "standard_tracking"
+    baseline_config.control.criteria = "none"
     baseline_config.control.dli_target = 0.0
 
     result = solve_for_weather(
         source, metadata, weather_data, baseline_config, solver_name, solver_executable
     )
-    baseline_power = float(np.sum(result.power_w))
+    dt = (weather_data.index[1] - weather_data.index[0]).total_seconds() if len(weather_data.index) > 1 else 3600.0
+    baseline_energy_wh = float(np.sum(result.power_w) * dt / 3600.0)
     baseline_cf = float(result.capacity_factor)
-    return baseline_power, baseline_cf, result.power_w
+    return baseline_energy_wh, baseline_cf, result.power_w
 
 
 def search_dli_for_target_power_ratio(
@@ -1277,6 +1308,7 @@ def search_dli_for_target_power_ratio(
     solver_name: str,
     solver_executable: Optional[str],
     baseline_power: float,
+    
     target_power_ratio: float,
     dli_min: float,
     dli_max: float,
@@ -1325,7 +1357,8 @@ def search_dli_for_target_power_ratio(
             result = solve_for_weather(
                 source, metadata, weather_data, test_config, solver_name, solver_executable
             )
-            current_power = float(np.sum(result.power_w))
+            dt = (weather_data.index[1] - weather_data.index[0]).total_seconds() if len(weather_data.index) > 1 else 3600.0
+            current_power = float(np.sum(result.power_w) * dt / 3600.0)
             current_ratio = current_power / baseline_power if baseline_power > 0 else 0.0
             ratio_diff = abs(current_ratio - target_power_ratio)
 
@@ -1357,12 +1390,15 @@ def search_dli_for_target_power_ratio(
         raise RuntimeError(f"Unable to find DLI value satisfying target power ratio={target_power_ratio*100:.1f}%")
 
     # Calculate metrics
-    dli_avg = float(np.mean(best_result.dli_series))
-    achieved_ratio = float(np.sum(best_result.power_w)) / baseline_power if baseline_power > 0 else 0.0
+    n_days = _n_days_from_index(best_result.hourly_index)
+    dli_avg = float(np.sum(best_result.dli_series) / n_days) if best_result.dli_series is not None else 0.0
+    dt = (weather_data.index[1] - weather_data.index[0]).total_seconds() if len(weather_data.index) > 1 else 3600.0
+    achieved_ratio = float(np.sum(best_result.power_w) * dt / 3600.0) / baseline_power if baseline_power > 0 else 0.0
     drr = (dli_avg / best_dli) * 100.0 if best_dli > 0 else 0.0
 
     # Update result object
-    best_result.baseline_cf = (baseline_power / (len(best_result.power_w) * config.power.pdc0)) * 100 if len(best_result.power_w) > 0 else 0.0
+    hours = (len(best_result.power_w) * dt / 3600.0) if len(best_result.power_w) > 0 else 0.0
+    best_result.baseline_cf = (baseline_power / (hours * config.power.pdc0) * 100) if hours > 0 else 0.0
     best_result.target_prr = target_power_ratio * 100  # Store as percentage for compatibility
     achieved_prr_percent = _clamp_ratio_percent(achieved_ratio * 100.0)
     best_result.achieved_prr = achieved_prr_percent
@@ -1410,7 +1446,8 @@ def write_outputs(
     longitude = _safe_float(result.metadata.get("longitude"), float("nan"))
 
     # Calculate average DLI
-    dli_avg = float(np.mean(result.dli_series)) if result.dli_series is not None else 0.0
+    n_days = _n_days_from_index(result.hourly_index)
+    dli_avg = float(np.sum(result.dli_series) / n_days) if result.dli_series is not None else 0.0
 
     if reverse_mode and result.baseline_cf is not None:
         # Reverse mode (PRR -> DLI): output DLI map fields
@@ -1511,7 +1548,7 @@ Examples:
     )
     parser.add_argument(
         "--criteria",
-        choices=["dli", "biomass"],
+        choices=["dli", "biomass", "none"],
         default="dli",
         help="Plant constraint type (default: dli)",
     )
@@ -1747,7 +1784,8 @@ def main() -> None:
 
             timeseries_path, point_record = write_outputs(result, output_dir, reverse_mode=True)
             point_record["baseline_power_mwh"] = baseline_power / 1e6
-            point_record["achieved_power_mwh"] = float(np.sum(result.power_w)) / 1e6
+            dt = (weather_data.index[1] - weather_data.index[0]).total_seconds() if len(weather_data.index) > 1 else 3600.0
+            point_record["achieved_power_mwh"] = (float(np.sum(result.power_w) * dt / 3600.0)) / 1e6
             point_record["power_ratio_percent"] = result.achieved_prr
             point_records.append(point_record)
             summaries.append({
@@ -1755,7 +1793,7 @@ def main() -> None:
                 "solver_status": result.solver_status,
                 "termination": result.solver_termination,
                 "baseline_power_mwh": baseline_power / 1e6,
-                "achieved_power_mwh": float(np.sum(result.power_w)) / 1e6,
+                "achieved_power_mwh": (float(np.sum(result.power_w) * dt / 3600.0)) / 1e6,
                 "power_ratio_percent": result.achieved_prr,
                 "dli_target_found": result.dli_target_found,
                 "dli_avg": result.dli_avg,
@@ -1769,10 +1807,12 @@ def main() -> None:
                 result = solve_for_weather(
                     csv_path, metadata, weather_data, config, args.solver, args.solver_executable
                 )
-                achieved_power = float(np.sum(result.power_w))
+                dt = (weather_data.index[1] - weather_data.index[0]).total_seconds() if len(weather_data.index) > 1 else 3600.0
+                achieved_power = float(np.sum(result.power_w) * dt / 3600.0)
                 power_ratio = (achieved_power / baseline_power * 100.0) if baseline_power > 0 else 0.0
                 power_ratio = _clamp_ratio_percent(power_ratio)
-                dli_avg = float(np.mean(result.dli_series))
+                n_days = _n_days_from_index(result.hourly_index)
+                dli_avg = float(np.sum(result.dli_series) / n_days) if result.dli_series is not None else 0.0
 
                 # Update result with power-based metrics
                 result.baseline_cf = baseline_cf
