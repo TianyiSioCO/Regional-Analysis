@@ -19,6 +19,13 @@ References:
   - NSRDB TMY (Typical Meteorological Year) data format
   - pvlib solar position algorithms
 
+DIAGNOSTIC ENHANCEMENTS:
+  - Comprehensive iteration logging for binary search
+  - Configuration isolation to prevent state pollution
+  - Wider DLI search range [10, 80] instead of [15, 50]
+  - Tighter convergence tolerance (0.5% instead of 1.0%)
+  - Detailed convergence reporting
+
 Author: EERL TZ
 """
 from __future__ import annotations
@@ -274,7 +281,7 @@ class AgritrackResult:
         prr: Power Realization Ratio (same as CF in forward mode) [%]
 
     Reverse Mode Fields (PRR → DLI search):
-        baseline_cf: Baseline CF_ST from unconstrained dynamic tracking [%]
+        baseline_cf: Baseline CF_ST from Standard Tracking (no crop constraint) [%]
         target_prr: User-specified target PRR [%]
         achieved_prr: Actual PRR achieved = CF / CF_ST × 100 [%]
         dli_target_found: DLI constraint value found by binary search [mol/m²/day]
@@ -345,15 +352,6 @@ def _clamp_ratio_percent(ratio_percent: float, upper: float = 100.0) -> float:
         return upper
     return ratio_percent
 
-
-
-def _n_days_from_index(index: pd.DatetimeIndex) -> int:
-    """Return number of unique (calendar) days in a timezone-aware hourly index."""
-    try:
-        n = int(pd.Index(index.normalize()).nunique())
-    except Exception:
-        n = 0
-    return max(1, n)
 
 def _to_timezone(timestamp: pd.Timestamp, timezone: str) -> pd.Timestamp:
     """Convert timestamp to specified timezone."""
@@ -583,11 +581,6 @@ def solve_for_weather(
         raise ValueError("Insufficient timesteps: need at least 2 data points")
     time_interval = (hourly_timesteps[1] - hourly_timesteps[0]).total_seconds()
 
-    # Number of simulation days (for DLI aggregation)
-    n_days_sim = int(pd.Index(hourly_timesteps.normalize()).nunique())
-    if n_days_sim <= 0:
-        n_days_sim = 1
-
     # -------------------------------------------------------------------------
     # Step 1: Calculate solar position using pvlib
     # θ_e = solar elevation angle, φ_a = solar azimuth angle
@@ -708,14 +701,14 @@ def solve_for_weather(
             n_days = day
             break
 
-
-    # If maturity is reached early, trim all daily arrays consistently
+    # If the crop reaches maturity earlier than the simulated time window, `n_days` is
+    # shortened. Keep all daily arrays consistent with the shortened horizon to avoid
+    # shape mismatches (e.g. broadcasting errors) in later vectorized operations.
+    thermal_time = thermal_time[: n_days + 1]
     daily_srads = daily_srads[:n_days]
     daily_min_temp = daily_min_temp[:n_days]
     daily_max_temp = daily_max_temp[:n_days]
     daily_mean_temp = daily_mean_temp[:n_days]
-    d_thermal_time = d_thermal_time[:n_days]
-    thermal_time = thermal_time[: n_days + 1]
 
     # Temperature stress factor: linear response between base and optimal temp
     temp_growth = np.clip(
@@ -787,9 +780,8 @@ def solve_for_weather(
         )
         # Fix angles for non-optimized strategies
         if tracking.strategy == "standard_tracking":
-            model.theta_fix = ConstraintList()
             for idx in range(len(hourly_timesteps)):
-                model.theta_fix.add(model.theta[idx] == angle_tracking[idx])
+                model.theta[idx].fix(angle_tracking[idx])
         elif tracking.strategy == "antitracking":
             for idx in range(len(hourly_timesteps)):
                 model.theta[idx].fix(angle_antitracking[idx])
@@ -875,7 +867,7 @@ def solve_for_weather(
         # Biomass constraint: final biomass ≥ requirement ratio × reference
         model.daily_radiation = Expression(
             range(n_days),
-            rule=lambda mdl, day: _daily_radiation_average(mdl, day, steps_per_day, time_interval, len(hourly_timesteps)),
+            rule=lambda mdl, day: _daily_radiation_average(mdl, day, steps_per_day, time_interval),
         )
         model.cumulative_biomass = Var(range(n_days + 1), initialize=plant_cfg.initial_biomass)
         model.cumulative_biomass_constraints = ConstraintList()
@@ -903,16 +895,14 @@ def solve_for_weather(
             rule=lambda mdl, t: mdl.ground_radiation[t]
             * weather_cfg.ratio_par
             * weather_cfg.qc_par
-            * time_interval
+            * 24
+            * 3600
             / 1e6,
         )
         model.dli_constraint = Constraint(
-            expr=sum(model.dli_expr[t] for t in range(len(hourly_timesteps))) / n_days_sim
+            expr=sum(model.dli_expr[t] for t in range(len(hourly_timesteps))) / len(hourly_timesteps)
             >= control.dli_target
         )
-    elif control.criteria == "none":
-        # No crop constraint (baseline/unconstrained run)
-        pass
     else:
         raise ValueError(f"Unknown crop constraint type: {control.criteria}")
 
@@ -968,13 +958,13 @@ def solve_for_weather(
     )
 
     # Back surface irradiance (faces ground):
+    # G_back = DHI·(1-cos(θ-β_S))/2 + ρ·G_ground·(1+cos(θ+β_L))/2
     def back_surface_irradiance_expr(mdl, t):
         return (
             dhi[t] * (1 - cos(mdl.theta[t] - mdl.blockage_angle_small[t])) / 2
             + weather_cfg.albedo * mdl.ground_radiation[t] * (cos(mdl.theta[t] + mdl.blockage_angle_large[t]) + 1) / 2
         )
 
-    # G_back = DHI·(1-cos(θ-β_S))/2 + ρ·G_ground·(1+cos(θ+β_L))/2
     model.back_surface_irradiance = Expression(
         range(len(hourly_timesteps)), rule=back_surface_irradiance_expr
     )
@@ -1053,7 +1043,8 @@ def solve_for_weather(
                 value(model.ground_radiation[idx])
                 * weather_cfg.ratio_par
                 * weather_cfg.qc_par
-                * time_interval
+                * 24
+                * 3600
                 / 1e6
             )
             for idx in range(len(hourly_timesteps))
@@ -1065,10 +1056,9 @@ def solve_for_weather(
             [float(value(model.cumulative_biomass[idx])) for idx in range(n_days + 1)]
         )
 
-    energy_wh = float(np.sum(power_values) * time_interval / 3600.0)
+    total_power = float(np.sum(power_values))
     capacity_factor = (
-        energy_wh / (power_cfg.pdc0 * (len(power_values) * time_interval / 3600.0)) * 100
-        if len(power_values) else 0.0
+        total_power / (len(power_values) * power_cfg.pdc0) * 100 if len(power_values) else 0.0
     )
     prr = capacity_factor
 
@@ -1088,14 +1078,10 @@ def solve_for_weather(
     )
 
 
-def _daily_radiation_average(model: ConcreteModel, day: int, steps_per_day: float, time_interval: float, n_steps: int):
-    start_idx = int(round(day * steps_per_day))
-    end_idx = int(round((day + 1) * steps_per_day))
-    # Clamp indices to available timesteps
-    start_idx = max(0, min(start_idx, n_steps))
-    end_idx = max(start_idx, min(end_idx, n_steps))
-    duration = max((end_idx - start_idx) * time_interval, 1e-9)
-    # model.ground_radiation_plant is MJ/m^2 per timestep; average to MJ/m^2/day
+def _daily_radiation_average(model: ConcreteModel, day: int, steps_per_day: float, time_interval: float):
+    start_idx = round(day * steps_per_day)
+    end_idx = round((day + 1) * steps_per_day)
+    duration = (end_idx - start_idx) * time_interval
     return sum(model.ground_radiation_plant[t] for t in range(start_idx, end_idx)) / (duration / 86400)
 
 
@@ -1264,13 +1250,11 @@ def compute_baseline_power_optimized(
     solver_name: str,
     solver_executable: Optional[str],
 ) -> Tuple[float, float, np.ndarray]:
-    """Compute baseline power via unconstrained optimization (Standard Tracking baseline).
+    """Compute baseline power using Standard Tracking (no crop constraint).
 
-    Baseline is defined as the maximum achievable power generation at the location when
-    tracker angles are optimized to maximize power WITHOUT crop constraints (no DLI/biomass).
-
-    This guarantees that any constrained run (with DLI/biomass) cannot exceed the baseline,
-    except for negligible numerical tolerance.
+    Baseline is computed by fixing tracker angles to Standard Tracking (sun-following with
+    backtracking) and removing crop constraints (DLI/biomass). DLI target is set to 0 so the
+    constraint is always satisfied.
 
     Args:
         source: Path to CSV file
@@ -1288,16 +1272,13 @@ def compute_baseline_power_optimized(
     """
     baseline_config = copy.deepcopy(config)
     baseline_config.tracking.strategy = "standard_tracking"
-    baseline_config.control.criteria = "none"
+    baseline_config.control.criteria = "dli"
     baseline_config.control.dli_target = 0.0
 
-    result = solve_for_weather(
-        source, metadata, weather_data, baseline_config, solver_name, solver_executable
+    baseline_power, baseline_cf, power_array = compute_baseline_power(
+        metadata, weather_data, baseline_config
     )
-    dt = (weather_data.index[1] - weather_data.index[0]).total_seconds() if len(weather_data.index) > 1 else 3600.0
-    baseline_energy_wh = float(np.sum(result.power_w) * dt / 3600.0)
-    baseline_cf = float(result.capacity_factor)
-    return baseline_energy_wh, baseline_cf, result.power_w
+    return baseline_power, baseline_cf, power_array
 
 
 def search_dli_for_target_power_ratio(
@@ -1308,17 +1289,22 @@ def search_dli_for_target_power_ratio(
     solver_name: str,
     solver_executable: Optional[str],
     baseline_power: float,
-    
     target_power_ratio: float,
     dli_min: float,
     dli_max: float,
     tolerance: float,
     max_iter: int,
 ) -> AgritrackResult:
-    """Binary search for DLI value that achieves target power ratio.
-
-    This is a simpler and more intuitive approach than PRR.
-    Directly uses power generation ratio: P_target = P_baseline × ratio
+    """
+    Binary search for DLI value that achieves target power ratio.
+    
+    LOGIC:
+    - Higher DLI → More light to crops → Less power → Lower power ratio
+    - Lower DLI → Less light to crops → More power → Higher power ratio
+    
+    SEARCH DIRECTION:
+    - If current_ratio > target → Need to reduce power → Increase DLI (search higher)
+    - If current_ratio < target → Need to increase power → Decrease DLI (search lower)
 
     Args:
         source: Path to CSV file
@@ -1327,7 +1313,7 @@ def search_dli_for_target_power_ratio(
         config: Base configuration
         solver_name: Solver name
         solver_executable: Optional path to solver executable
-        baseline_power: Baseline total power from unconstrained optimized baseline [Wh]
+        baseline_power: Baseline total power from Standard Tracking (no crop constraint) [Wh]
         target_power_ratio: Target ratio (0-1), e.g., 0.8 = 80% of baseline
         dli_min: Lower bound for DLI search
         dli_max: Upper bound for DLI search
@@ -1338,9 +1324,17 @@ def search_dli_for_target_power_ratio(
         AgritrackResult containing search results
     """
     target_power = baseline_power * target_power_ratio
-    print(f"  Baseline Power: {baseline_power/1e6:.2f} MWh")
-    print(f"  Target Power Ratio: {target_power_ratio*100:.1f}% -> Target Power: {target_power/1e6:.2f} MWh")
-    print(f"  DLI search range: [{dli_min}, {dli_max}] mol/m2/day")
+    
+    print(f"  {'='*70}")
+    print(f"  REVERSE MODE SEARCH STARTING")
+    print(f"  {'='*70}")
+    print(f"  Location: {source.stem}")
+    print(f"  Baseline Power (Standard Tracking): {baseline_power/1e6:.6f} MWh")
+    print(f"  Target Power Ratio: {target_power_ratio*100:.2f}%")
+    print(f"  Target Power: {target_power/1e6:.6f} MWh")
+    print(f"  DLI search range: [{dli_min:.2f}, {dli_max:.2f}] mol/m2/day")
+    print(f"  Tolerance: {tolerance*100:.2f}%")
+    print(f"  {'='*70}")
 
     low, high = dli_min, dli_max
     best_result: Optional[AgritrackResult] = None
@@ -1350,6 +1344,7 @@ def search_dli_for_target_power_ratio(
     for iteration in range(max_iter):
         mid_dli = (low + high) / 2.0
 
+        # Create fresh config for this iteration
         test_config = copy.deepcopy(config)
         test_config.control.dli_target = mid_dli
 
@@ -1357,12 +1352,16 @@ def search_dli_for_target_power_ratio(
             result = solve_for_weather(
                 source, metadata, weather_data, test_config, solver_name, solver_executable
             )
-            dt = (weather_data.index[1] - weather_data.index[0]).total_seconds() if len(weather_data.index) > 1 else 3600.0
-            current_power = float(np.sum(result.power_w) * dt / 3600.0)
+            current_power = float(np.sum(result.power_w))
             current_ratio = current_power / baseline_power if baseline_power > 0 else 0.0
-            ratio_diff = abs(current_ratio - target_power_ratio)
+            ratio_error = current_ratio - target_power_ratio
+            ratio_diff = abs(ratio_error)
 
-            print(f"  Iteration {iteration + 1}: DLI={mid_dli:.2f} -> Power={current_power/1e6:.2f} MWh, Ratio={current_ratio*100:.2f}%")
+            print(f"  Iter {iteration + 1:2d}: DLI={mid_dli:6.2f} → "
+                  f"Power={current_power/1e6:8.6f} MWh "
+                  f"({current_ratio*100:6.2f}%) "
+                  f"[Error: {ratio_error*100:+6.2f}%] "
+                  f"[Range: {low:.2f}-{high:.2f}]")
 
             # Record best result
             if ratio_diff < best_power_diff:
@@ -1372,34 +1371,45 @@ def search_dli_for_target_power_ratio(
 
             # Check if tolerance is reached
             if ratio_diff <= tolerance:
-                print(f"  Converged! Found DLI={mid_dli:.2f} achieving Power Ratio={current_ratio*100:.2f}% (target {target_power_ratio*100:.1f}%)")
+                print(f"  ✓ CONVERGED! DLI={mid_dli:.2f} achieves {current_ratio*100:.2f}% "
+                      f"(target {target_power_ratio*100:.2f}%, error {ratio_error*100:+.2f}%)")
                 break
 
             # Binary search logic:
-            # Higher DLI -> more light to crops -> less power -> lower ratio
+            # Higher DLI → more light to crops → less power → lower ratio
             if current_ratio > target_power_ratio:
                 low = mid_dli  # Ratio too high, increase DLI (reduce power)
+                print(f"           → Ratio too HIGH, searching HIGHER DLI (reduce power)")
             else:
                 high = mid_dli  # Ratio too low, decrease DLI (increase power)
+                print(f"           → Ratio too LOW, searching LOWER DLI (increase power)")
 
         except RuntimeError as e:
-            print(f"  Iteration {iteration + 1}: DLI={mid_dli:.2f} -> Solver failed: {e}")
+            print(f"  Iter {iteration + 1:2d}: DLI={mid_dli:6.2f} → SOLVER FAILED: {e}")
             high = mid_dli
 
     if best_result is None:
-        raise RuntimeError(f"Unable to find DLI value satisfying target power ratio={target_power_ratio*100:.1f}%")
+        raise RuntimeError(f"Unable to find DLI satisfying target power ratio={target_power_ratio*100:.2f}%")
 
-    # Calculate metrics
-    n_days = _n_days_from_index(best_result.hourly_index)
-    dli_avg = float(np.sum(best_result.dli_series) / n_days) if best_result.dli_series is not None else 0.0
-    dt = (weather_data.index[1] - weather_data.index[0]).total_seconds() if len(weather_data.index) > 1 else 3600.0
-    achieved_ratio = float(np.sum(best_result.power_w) * dt / 3600.0) / baseline_power if baseline_power > 0 else 0.0
+    # Calculate final metrics
+    dli_avg = float(np.mean(best_result.dli_series))
+    achieved_power = float(np.sum(best_result.power_w))
+    achieved_ratio = achieved_power / baseline_power if baseline_power > 0 else 0.0
     drr = (dli_avg / best_dli) * 100.0 if best_dli > 0 else 0.0
 
+    print(f"  {'='*70}")
+    print(f"  SEARCH COMPLETE")
+    print(f"  Final DLI found: {best_dli:.2f} mol/m2/day")
+    print(f"  Achieved power: {achieved_power/1e6:.6f} MWh ({achieved_ratio*100:.2f}%)")
+    print(f"  Target power: {target_power/1e6:.6f} MWh ({target_power_ratio*100:.2f}%)")
+    print(f"  Final error: {(achieved_ratio - target_power_ratio)*100:+.2f}%")
+    print(f"  Average DLI: {dli_avg:.2f} mol/m2/day")
+    print(f"  DRR: {drr:.2f}%")
+    print(f"  {'='*70}\n")
+
     # Update result object
-    hours = (len(best_result.power_w) * dt / 3600.0) if len(best_result.power_w) > 0 else 0.0
-    best_result.baseline_cf = (baseline_power / (hours * config.power.pdc0) * 100) if hours > 0 else 0.0
-    best_result.target_prr = target_power_ratio * 100  # Store as percentage for compatibility
+    best_result.baseline_cf = (baseline_power / (len(best_result.power_w) * config.power.pdc0)) * 100 if len(best_result.power_w) > 0 else 0.0
+    best_result.target_prr = target_power_ratio * 100
     achieved_prr_percent = _clamp_ratio_percent(achieved_ratio * 100.0)
     best_result.achieved_prr = achieved_prr_percent
     best_result.prr = achieved_prr_percent
@@ -1446,8 +1456,7 @@ def write_outputs(
     longitude = _safe_float(result.metadata.get("longitude"), float("nan"))
 
     # Calculate average DLI
-    n_days = _n_days_from_index(result.hourly_index)
-    dli_avg = float(np.sum(result.dli_series) / n_days) if result.dli_series is not None else 0.0
+    dli_avg = float(np.mean(result.dli_series)) if result.dli_series is not None else 0.0
 
     if reverse_mode and result.baseline_cf is not None:
         # Reverse mode (PRR -> DLI): output DLI map fields
@@ -1517,23 +1526,18 @@ def find_data_files(data_dir: Path) -> list:
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Agrivoltaic Tracking Optimization - Power Generation vs Crop DLI",
+        description="Agrivoltaic Tracking Optimization - DIAGNOSTIC VERSION",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Reverse mode (default): Find DLI for 80% of baseline power (unconstrained optimized baseline)
-  python AnalyzeData/main.py
-
-  # Forward mode: Input DLI=30, output power ratio vs baseline (unconstrained optimized baseline)
-  python AnalyzeData/main.py --forward --dli-target 30
-
-  # Reverse mode: Custom target power (0-1 ratio or 0-100 percent)
-  python AnalyzeData/main.py --target-power 0.75
-  python AnalyzeData/main.py --target-power 75
+  # Reverse mode: Find DLI for 80% power
+  python main_complete.py --target-power 0.80
+  
+  # Forward mode: Input DLI=30, output power ratio
+  python main_complete.py --forward --dli-target 30
         """
     )
 
-    # Compute default input files: automatically scan data subdirectories
     script_dir = Path(__file__).parent
     data_dir = script_dir / "data"
     default_inputs = find_data_files(data_dir)
@@ -1548,7 +1552,7 @@ Examples:
     )
     parser.add_argument(
         "--criteria",
-        choices=["dli", "biomass", "none"],
+        choices=["dli", "biomass"],
         default="dli",
         help="Plant constraint type (default: dli)",
     )
@@ -1573,18 +1577,18 @@ Examples:
     mode_group.add_argument(
         "--forward",
         action="store_true",
-        help="Forward mode: Input DLI -> Output power ratio vs baseline (unconstrained optimized baseline)",
+        help="Forward mode: Input DLI -> Output power ratio vs baseline (Standard Tracking baseline)",
     )
     mode_group.add_argument(
         "--target-power",
         "--target-power-ratio",
         dest="target_power_ratio",
         type=float,
-        default=0.8,
+        default=0.85,
         metavar="RATIO",
         help=(
-            "Reverse mode: target power ratio vs baseline (unconstrained optimized baseline). "
-            "Accepts 0-1 ratio or 0-100 percent (default: 0.8)."
+            "Reverse mode: target power ratio vs baseline (Standard Tracking baseline). "
+            "Accepts 0-1 ratio or 0-100 percent (default: 0.85)."
         ),
     )
 
@@ -1598,35 +1602,35 @@ Examples:
         help="DLI target value (mol/m2/day), default 20",
     )
 
-    # Reverse mode parameters
+    # Reverse mode parameters (UPDATED DEFAULTS)
     reverse_group = parser.add_argument_group("Reverse Mode Parameters (DLI Search)")
     reverse_group.add_argument(
         "--dli-min",
         type=float,
-        default=15.0,
+        default=10.0,
         metavar="MIN",
-        help="Lower bound for DLI search (mol/m2/day), default 15",
+        help="Lower bound for DLI search (mol/m2/day), default 10",
     )
     reverse_group.add_argument(
         "--dli-max",
         type=float,
-        default=50.0,
+        default=80.0,
         metavar="MAX",
-        help="Upper bound for DLI search (mol/m2/day), default 50",
+        help="Upper bound for DLI search (mol/m2/day), default 80",
     )
     reverse_group.add_argument(
         "--tolerance",
         type=float,
-        default=1.0,
+        default=0.5,
         metavar="TOL",
-        help="Power ratio error tolerance (%%), default 1.0",
+        help="Power ratio error tolerance (%%), default 0.5",
     )
     reverse_group.add_argument(
         "--max-iter",
         type=int,
-        default=20,
+        default=25,
         metavar="N",
-        help="Maximum search iterations, default 20",
+        help="Maximum search iterations, default 25",
     )
 
     return parser.parse_args()
@@ -1634,9 +1638,12 @@ Examples:
 
 def main() -> None:
     args = parse_arguments()
+    
+    # Create FRESH config (avoid pollution between runs)
     config = AgritrackConfig()
     config.control.criteria = args.criteria
     config.control.dli_target = args.dli_target
+    
     output_dir = Path(args.output_dir)
     summaries = []
     point_records = []
@@ -1668,26 +1675,25 @@ def main() -> None:
             raise ValueError(f"Invalid target power ratio: {raw}. Expected 0-1 or 0-100.")
         return ratio
 
-    # Scheme 2:
-    # - Default: Reverse mode (target power ratio -> search DLI)
-    # - Forward:  --forward (input DLI -> compute power ratio vs baseline)
     reverse_mode = not args.forward
     target_power_ratio = normalize_target_power_ratio(args.target_power_ratio)
 
+    print("\n" + "="*80)
     if reverse_mode:
-        print(f"=== Reverse Mode: Target Power Ratio {target_power_ratio*100:.1f}% -> Search DLI ===")
-        print("  Baseline: Unconstrained power-maximizing optimization (Standard Tracking baseline)")
-        print(f"  DLI search range: [{args.dli_min}, {args.dli_max}] mol/m2/day")
-        print(f"  Tolerance: {args.tolerance}%")
+        print(f"REVERSE MODE: Target Power Ratio {target_power_ratio*100:.1f}% → Search DLI")
+        print(f"Baseline: Standard Tracking (no crop constraint)")
+        print(f"DLI search range: [{args.dli_min}, {args.dli_max}] mol/m2/day")
+        print(f"Tolerance: {args.tolerance}%")
     else:
-        print(f"=== Forward Mode: Input DLI={args.dli_target} -> Compute Power ===")
-        print("  Baseline: Unconstrained power-maximizing optimization (Standard Tracking baseline)")
+        print(f"FORWARD MODE: Input DLI={args.dli_target} → Compute Power")
+        print(f"Baseline: Standard Tracking (no crop constraint)")
+    print("="*80 + "\n")
 
     for idx, input_path in enumerate(args.inputs, 1):
         try:
             csv_path = resolve_input_path(input_path)
         except FileNotFoundError as error:
-            print(f"\n[{idx}/{len(args.inputs)}] Skipped! {error}")
+            print(f"\n[{idx}/{len(args.inputs)}] ⚠ SKIPPED: {error}")
             summaries.append({
                 "file": str(input_path),
                 "solver_status": "failed",
@@ -1707,7 +1713,7 @@ def main() -> None:
                 csv_path, LocationConfig()
             )
         except Exception as error:
-            print(f"\n[{idx}/{len(args.inputs)}] Skipped! Failed to load {csv_path}: {error}")
+            print(f"\n[{idx}/{len(args.inputs)}] ⚠ SKIPPED: Failed to load {csv_path}: {error}")
             summaries.append({
                 "file": str(csv_path),
                 "solver_status": "failed",
@@ -1721,25 +1727,30 @@ def main() -> None:
                 "timeseries_csv": "",
             })
             continue
-        config.location = updated_location
-        print(f"\n[{idx}/{len(args.inputs)}] Loaded file: {csv_path}")
-        print(f"  Location: ({updated_location.latitude}, {updated_location.longitude})")
-        print(f"  Timezone: {updated_location.timezone}")
-        print(f"  Time range: {updated_location.start} ~ {updated_location.end}")
+            
+        # Update location in a FRESH config copy for this location
+        location_config = copy.deepcopy(config)
+        location_config.location = updated_location
+        
+        print(f"\n{'='*80}")
+        print(f"[{idx}/{len(args.inputs)}] Processing: {csv_path.name}")
+        print(f"{'='*80}")
+        print(f"Location: ({updated_location.latitude:.4f}, {updated_location.longitude:.4f})")
+        print(f"Timezone: {updated_location.timezone}")
+        print(f"Time range: {updated_location.start} ~ {updated_location.end}")
 
-        # Always compute baseline power using unconstrained optimization (Standard Tracking baseline)
-        print("  Computing baseline power (Unconstrained optimization / Standard Tracking baseline)...")
+        print(f"\nComputing baseline (Standard Tracking, no constraints)...")
         try:
             baseline_power, baseline_cf, _ = compute_baseline_power_optimized(
                 csv_path,
                 metadata,
                 weather_data,
-                config,
+                location_config,
                 args.solver,
                 args.solver_executable,
             )
         except Exception as error:
-            print(f"  Skipped! Baseline computation failed: {error}")
+            print(f"⚠ SKIPPED: Baseline computation failed: {error}")
             summaries.append({
                 "file": str(csv_path),
                 "solver_status": "failed",
@@ -1753,14 +1764,14 @@ def main() -> None:
                 "timeseries_csv": "",
             })
             continue
-        print(f"  Baseline Power: {baseline_power/1e6:.4f} MWh, CF: {baseline_cf:.2f}%")
+            
+        print(f"✓ Baseline computed: {baseline_power/1e6:.6f} MWh (CF: {baseline_cf:.2f}%)")
 
         if reverse_mode:
-            # Reverse mode: Input target power ratio -> Search DLI
-            print(f"  Searching for DLI that achieves {target_power_ratio*100:.1f}% power ratio...")
+            print(f"\nStarting DLI search for {target_power_ratio*100:.2f}% power ratio...")
             try:
                 result = search_dli_for_target_power_ratio(
-                    csv_path, metadata, weather_data, config,
+                    csv_path, metadata, weather_data, location_config,
                     args.solver, args.solver_executable,
                     baseline_power, target_power_ratio,
                     args.dli_min, args.dli_max,
@@ -1768,7 +1779,7 @@ def main() -> None:
                     args.max_iter
                 )
             except Exception as error:
-                print(f"  Skipped! Reverse search failed: {error}")
+                print(f"⚠ SKIPPED: Reverse search failed: {error}")
                 summaries.append({
                     "file": str(csv_path),
                     "solver_status": "failed",
@@ -1784,16 +1795,16 @@ def main() -> None:
 
             timeseries_path, point_record = write_outputs(result, output_dir, reverse_mode=True)
             point_record["baseline_power_mwh"] = baseline_power / 1e6
-            dt = (weather_data.index[1] - weather_data.index[0]).total_seconds() if len(weather_data.index) > 1 else 3600.0
-            point_record["achieved_power_mwh"] = (float(np.sum(result.power_w) * dt / 3600.0)) / 1e6
+            point_record["achieved_power_mwh"] = float(np.sum(result.power_w)) / 1e6
             point_record["power_ratio_percent"] = result.achieved_prr
             point_records.append(point_record)
+            
             summaries.append({
                 "file": str(csv_path),
                 "solver_status": result.solver_status,
                 "termination": result.solver_termination,
                 "baseline_power_mwh": baseline_power / 1e6,
-                "achieved_power_mwh": (float(np.sum(result.power_w) * dt / 3600.0)) / 1e6,
+                "achieved_power_mwh": float(np.sum(result.power_w)) / 1e6,
                 "power_ratio_percent": result.achieved_prr,
                 "dli_target_found": result.dli_target_found,
                 "dli_avg": result.dli_avg,
@@ -1801,36 +1812,32 @@ def main() -> None:
             })
 
         else:
-            # Forward mode: Input DLI -> Compute Power
-            print(f"  Running optimization solver (DLI={config.control.dli_target})...")
+            print(f"\nRunning optimization (DLI={location_config.control.dli_target})...")
             try:
                 result = solve_for_weather(
-                    csv_path, metadata, weather_data, config, args.solver, args.solver_executable
+                    csv_path, metadata, weather_data, location_config, args.solver, args.solver_executable
                 )
-                dt = (weather_data.index[1] - weather_data.index[0]).total_seconds() if len(weather_data.index) > 1 else 3600.0
-                achieved_power = float(np.sum(result.power_w) * dt / 3600.0)
+                achieved_power = float(np.sum(result.power_w))
                 power_ratio = (achieved_power / baseline_power * 100.0) if baseline_power > 0 else 0.0
                 power_ratio = _clamp_ratio_percent(power_ratio)
-                n_days = _n_days_from_index(result.hourly_index)
-                dli_avg = float(np.sum(result.dli_series) / n_days) if result.dli_series is not None else 0.0
+                dli_avg = float(np.mean(result.dli_series))
 
-                # Update result with power-based metrics
                 result.baseline_cf = baseline_cf
                 result.prr = power_ratio
                 result.achieved_prr = power_ratio
                 result.dli_avg = dli_avg
 
-                print(f"  Complete! Power: {achieved_power/1e6:.4f} MWh ({power_ratio:.2f}% of baseline)")
+                print(f"✓ Complete! Power: {achieved_power/1e6:.6f} MWh ({power_ratio:.2f}% of baseline)")
                 print(f"  DLI avg: {dli_avg:.2f} mol/m2/day")
 
                 timeseries_path, point_record = write_outputs(
-                    result, output_dir, reverse_mode=False, dli_target_used=config.control.dli_target
+                    result, output_dir, reverse_mode=False, dli_target_used=location_config.control.dli_target
                 )
-                # Override with power-based fields
                 point_record["baseline_power_mwh"] = baseline_power / 1e6
                 point_record["achieved_power_mwh"] = achieved_power / 1e6
                 point_record["power_ratio_percent"] = power_ratio
                 point_records.append(point_record)
+                
                 summaries.append({
                     "file": str(csv_path),
                     "solver_status": result.solver_status,
@@ -1838,12 +1845,12 @@ def main() -> None:
                     "baseline_power_mwh": baseline_power / 1e6,
                     "achieved_power_mwh": achieved_power / 1e6,
                     "power_ratio_percent": power_ratio,
-                    "dli_input": config.control.dli_target,
+                    "dli_input": location_config.control.dli_target,
                     "dli_avg": dli_avg,
                     "timeseries_csv": timeseries_path,
                 })
             except Exception as error:
-                print(f"  Skipped! Solver failed: {error}")
+                print(f"⚠ SKIPPED: Solver failed: {error}")
                 summaries.append({
                     "file": str(csv_path),
                     "solver_status": "failed",
@@ -1851,7 +1858,7 @@ def main() -> None:
                     "baseline_power_mwh": baseline_power / 1e6,
                     "achieved_power_mwh": None,
                     "power_ratio_percent": None,
-                    "dli_input": config.control.dli_target,
+                    "dli_input": location_config.control.dli_target,
                     "dli_avg": None,
                     "timeseries_csv": "",
                 })
@@ -1868,11 +1875,14 @@ def main() -> None:
     else:
         point_path = None
 
-    print("\nResults Summary:")
+    print("\n" + "="*80)
+    print("FINAL SUMMARY")
+    print("="*80)
     print(summary_df.to_string(index=False))
-    print(f"\nSummary file saved: {summary_path}")
+    print(f"\nSummary file: {summary_path}")
     if point_path:
         print(f"GIS point file: {point_path}")
+    print("="*80 + "\n")
 
 
 if __name__ == "__main__":
