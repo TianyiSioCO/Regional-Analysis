@@ -1587,7 +1587,7 @@ Examples:
         default=0.85, # SET: 0.85=85% of baseline (ST) power in reverse mode
         metavar="RATIO",
         help=(
-            "Reverse mode: Input target PRR (optimization achieved power / baseline power) -> Output DLI. "
+            "Reverse mode: Set target PRR (optimization achieved power / baseline power) -> Output DLI. "
             "Accepts 0-1 ratio or 0-100 percent (default: 0.85)."
         ),
     )
