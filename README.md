@@ -49,10 +49,10 @@ The script requires **IPOPT** solver. Download from [COIN-OR Releases](https://g
 
 ### Forward Mode (DLI → PRR)
 
-Standard mode: Specify DLI constraint, optimize for maximum power generation.
+Standard mode: Specify DLI constraint (e.g. dli_target=25), optimize for maximum power generation.
 Enter the program folder **gisAnalyzeData**  and run the following command in the terminal
 ```bash
-python main.py 
+python main.py --forward --dli-target 25
 ```
 
 The scrip will use the data from data folder as inputs and optimize it with IPOPT solver. The result will be stored in the output folder
@@ -65,10 +65,10 @@ The scrip will use the data from data folder as inputs and optimize it with IPOP
 
 ### Reverse Mode (PRR → DLI)
 
-Reverse mode: Specify target PRR%, search for the DLI value that achieves it.
-Enter the target PRR% and run the following command in the terminal. The following command uses 25 as an example.
+Reverse mode: In `gisAnalyzeData/main.py` (line 1587): modify target PRR% based on requirements (e.g. 0.85, default=0.85 gives 85% of baseline ST power in reverse mode), search for the DLI value that achieves it. 
+Enter the program folder **gisAnalyzeData** and run the following command in the terminal.
 ```bash
-python main.py --forward --dli-target 25
+python main.py
 ```
 
 ## Command Line Arguments
