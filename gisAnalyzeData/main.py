@@ -1530,11 +1530,11 @@ def parse_arguments() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Reverse mode: Find DLI for 80% power
-  python main_complete.py --target-power 0.80
+  # Reverse mode: Find DLI for 85% power ratio (line 1587: set default=0.85 for target_power_ratio=0.85)
+  python main.py
   
   # Forward mode: Input DLI=30, output power ratio
-  python main_complete.py --forward --dli-target 30
+  python main.py --forward --dli-target 30
         """
     )
 
@@ -1577,14 +1577,14 @@ Examples:
     mode_group.add_argument(
         "--forward",
         action="store_true",
-        help="Forward mode: Input DLI -> Output power ratio vs baseline (Standard Tracking baseline)",
+        help="Forward mode: Input DLI constraint -> Output PRR (percentage of ST baseline power achieved, i.e., optimization achieved power / baseline power)",
     )
     mode_group.add_argument(
         "--target-power",
         "--target-power-ratio",
         dest="target_power_ratio",
         type=float,
-        default=0.85,
+        default=0.85, # SET: 0.85=85% of baseline (ST) power in reverse mode
         metavar="RATIO",
         help=(
             "Reverse mode: target power ratio vs baseline (Standard Tracking baseline). "
